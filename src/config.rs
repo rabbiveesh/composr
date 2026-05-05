@@ -100,7 +100,10 @@ impl ResolvedConfig {
         if vendor_dir.is_dir() {
             for vendor in std::fs::read_dir(&vendor_dir)? {
                 let vendor = vendor?;
-                if !vendor.file_type()?.is_dir() {
+                // Follow symlinks: composer's `path` repositories install
+                // packages as symlinks pointing at sibling checkouts, and
+                // `file_type()` reports the symlink itself (not its target).
+                if !is_dir_following_symlinks(&vendor.path()) {
                     continue;
                 }
                 let vname = vendor.file_name();
@@ -114,7 +117,7 @@ impl ResolvedConfig {
                 for pkg in std::fs::read_dir(vendor.path())? {
                     let pkg = pkg?;
                     let pkg_path = pkg.path();
-                    if !pkg.file_type()?.is_dir() {
+                    if !is_dir_following_symlinks(&pkg_path) {
                         continue;
                     }
                     let composer_json = pkg_path.join("composer.json");
@@ -141,6 +144,32 @@ impl ResolvedConfig {
             packages,
         })
     }
+}
+
+/// Like `Path::is_dir()`, but explicitly follows symlinks. We want this for
+/// vendor package directories — composer's `path` repository type symlinks
+/// packages from sibling checkouts, and `DirEntry::file_type()` reports the
+/// symlink itself rather than the target.
+fn is_dir_following_symlinks(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Join `relative` onto `base` and lexically remove `.` components — without
+/// canonicalizing (which would resolve symlinks). Composer normalizes paths
+/// like `"Console": "./"` to drop the `./`, and our output paths must match
+/// byte-for-byte. We cannot canonicalize because `path` repositories install
+/// vendor packages as symlinks, and resolving those would put outputs under
+/// the symlink target rather than under `vendor/`.
+fn lexical_join(base: &Path, relative: &str) -> PathBuf {
+    let joined = base.join(relative);
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::CurDir => {} // drop `.`
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn load_package(
@@ -173,20 +202,20 @@ fn load_package(
         for (prefix, paths) in &sec.psr_4 {
             let entry = psr_4.entry(prefix.clone()).or_default();
             for p in paths.as_slice() {
-                entry.push(pkg_root.join(p));
+                entry.push(lexical_join(pkg_root, p));
             }
         }
         for (prefix, paths) in &sec.psr_0 {
             let entry = psr_0.entry(prefix.clone()).or_default();
             for p in paths.as_slice() {
-                entry.push(pkg_root.join(p));
+                entry.push(lexical_join(pkg_root, p));
             }
         }
         for c in &sec.classmap {
-            classmap.push(pkg_root.join(c));
+            classmap.push(lexical_join(pkg_root, c));
         }
         for f in &sec.files {
-            files.push(pkg_root.join(f));
+            files.push(lexical_join(pkg_root, f));
         }
         for x in &sec.exclude_from_classmap {
             excludes.push(x.clone());

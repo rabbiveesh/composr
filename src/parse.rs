@@ -10,9 +10,14 @@ pub enum DeclKind {
     Enum,
 }
 
+/// One class-like declaration. We store `fqcn` as raw bytes rather than a
+/// `String` because PHP identifiers may legally contain any byte ≥ 0x80
+/// (e.g. Symfony declares `class \xa9` in vendor/symfony/cache; UTF-8 lossy
+/// conversion would mangle that into U+FFFD and break byte-identity with
+/// Composer's classmap output).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Declaration {
-    pub fqcn: String,
+    pub fqcn: Vec<u8>,
     pub kind: DeclKind,
 }
 
@@ -153,19 +158,32 @@ fn recover_from_error(node: Node, src: &[u8], ns: &str, out: &mut Vec<Declaratio
             _ => None,
         };
         if let Some(kind) = kw {
-            // Find the next `name` token in the flat stream.
+            // After a keyword, find the next node usable as a name. We accept
+            // either an explicit `name` node or any node whose byte content
+            // is a valid PHP identifier — PHP lets identifiers contain
+            // \x80-\xff (some Symfony classes use a single Latin-1 byte as
+            // their name; tree-sitter-php parses that as ERROR rather than
+            // `name`, but Composer's tokenizer accepts it).
             let mut j = i + 1;
-            while j < flat.len() && flat[j].kind() != "name" {
+            let mut found: Option<&[u8]> = None;
+            while j < flat.len() {
+                if matches!(flat[j].kind(), "class" | "interface" | "trait" | "enum") {
+                    break;
+                }
+                if flat[j].kind() == "name" {
+                    found = Some(trim_ascii(&src[flat[j].byte_range()]));
+                    break;
+                }
+                let raw = &src[flat[j].byte_range()];
+                if is_php_identifier(raw) {
+                    found = Some(raw);
+                    break;
+                }
                 j += 1;
             }
-            if j < flat.len() {
-                let name = node_text(&flat[j], src).trim().to_string();
-                if !name.is_empty() {
-                    let fqcn = if ns.is_empty() {
-                        name
-                    } else {
-                        format!("{}\\{}", ns, name)
-                    };
+            if let Some(name_bytes) = found {
+                if !name_bytes.is_empty() {
+                    let fqcn = compose_fqcn(ns.as_bytes(), name_bytes);
                     out.push(Declaration { fqcn, kind });
                 }
                 i = j + 1;
@@ -176,6 +194,23 @@ fn recover_from_error(node: Node, src: &[u8], ns: &str, out: &mut Vec<Declaratio
     }
 }
 
+/// PHP identifier: `[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*`. Used by our
+/// ERROR-recovery to accept identifier bytes that tree-sitter-php's grammar
+/// rejects (notably single-byte high-bit names like Symfony's `class \xa9`).
+fn is_php_identifier(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let first = bytes[0];
+    let valid_start = first.is_ascii_alphabetic() || first == b'_' || first >= 0x80;
+    if !valid_start {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80)
+}
+
 fn emit_decl(node: &Node, src: &[u8], ns: &str, kind: DeclKind, out: &mut Vec<Declaration>) {
     let Some(name_node) = node.child_by_field_name("name") else {
         // Anonymous classes don't have a name field at this position; even
@@ -183,19 +218,40 @@ fn emit_decl(node: &Node, src: &[u8], ns: &str, kind: DeclKind, out: &mut Vec<De
         // not as siblings of class_declaration.
         return;
     };
-    let name = node_text(&name_node, src).trim().to_string();
-    if name.is_empty() {
+    let name_bytes = trim_ascii(&src[name_node.byte_range()]);
+    if name_bytes.is_empty() {
         return;
     }
-    let fqcn = if ns.is_empty() {
-        name
-    } else {
-        format!("{}\\{}", ns, name)
-    };
+    let fqcn = compose_fqcn(ns.as_bytes(), name_bytes);
     out.push(Declaration { fqcn, kind });
 }
 
+fn compose_fqcn(ns: &[u8], name: &[u8]) -> Vec<u8> {
+    if ns.is_empty() {
+        name.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(ns.len() + 1 + name.len());
+        v.extend_from_slice(ns);
+        v.push(b'\\');
+        v.extend_from_slice(name);
+        v
+    }
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
 fn node_text(node: &Node, src: &[u8]) -> String {
+    // Used only for namespace names which we expect to be ASCII / UTF-8.
     String::from_utf8_lossy(&src[node.byte_range()]).into_owned()
 }
 
@@ -213,11 +269,18 @@ mod tests {
         PhpParser::new().extract(src.as_bytes())
     }
 
+    fn fqcns(decls: &[Declaration]) -> Vec<String> {
+        decls
+            .iter()
+            .map(|d| String::from_utf8_lossy(&d.fqcn).into_owned())
+            .collect()
+    }
+
     #[test]
     fn file_level_namespace() {
         let r = extract("<?php\nnamespace Foo\\Bar;\nclass Baz {}\n");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].fqcn, "Foo\\Bar\\Baz");
+        assert_eq!(r[0].fqcn, b"Foo\\Bar\\Baz");
         assert_eq!(r[0].kind, DeclKind::Class);
     }
 
@@ -225,15 +288,15 @@ mod tests {
     fn braced_namespace() {
         let r = extract("<?php\nnamespace Foo { class A {} }\nnamespace Bar { class B {} }\n");
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].fqcn, "Foo\\A");
-        assert_eq!(r[1].fqcn, "Bar\\B");
+        assert_eq!(r[0].fqcn, b"Foo\\A");
+        assert_eq!(r[1].fqcn, b"Bar\\B");
     }
 
     #[test]
     fn no_namespace() {
         let r = extract("<?php\nclass GlobalCls {}\n");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].fqcn, "GlobalCls");
+        assert_eq!(r[0].fqcn, b"GlobalCls");
     }
 
     #[test]
@@ -264,8 +327,7 @@ mod tests {
         let r = extract(
             "<?php\nnamespace N;\nfunction f() { class Inside {} }\nclass Outside {}\n",
         );
-        let names: Vec<_> = r.iter().map(|d| d.fqcn.as_str()).collect();
-        assert_eq!(names, vec!["N\\Outside"]);
+        assert_eq!(fqcns(&r), vec!["N\\Outside"]);
     }
 
     #[test]
@@ -275,8 +337,7 @@ mod tests {
         let r = extract(
             "<?php\nif (PHP_VERSION_ID < 80300) {\n    class DateError extends Error {}\n}\n",
         );
-        let names: Vec<_> = r.iter().map(|d| d.fqcn.as_str()).collect();
-        assert_eq!(names, vec!["DateError"]);
+        assert_eq!(fqcns(&r), vec!["DateError"]);
     }
 
     #[test]
@@ -284,7 +345,7 @@ mod tests {
         let r = extract(
             "<?php\nnamespace G;\nif (false) {\n    class A {}\n} else {\n    class B {}\n}\n",
         );
-        let mut names: Vec<_> = r.iter().map(|d| d.fqcn.as_str()).collect();
+        let mut names = fqcns(&r);
         names.sort();
         assert_eq!(names, vec!["G\\A", "G\\B"]);
     }
@@ -297,8 +358,7 @@ mod tests {
         let r = extract(
             "<?php\nnamespace S;\nenum Requirement\n{\n    public const X = 'x';\n    case A;\n}\n",
         );
-        let names: Vec<_> = r.iter().map(|d| d.fqcn.as_str()).collect();
-        assert_eq!(names, vec!["S\\Requirement"]);
+        assert_eq!(fqcns(&r), vec!["S\\Requirement"]);
         assert_eq!(r[0].kind, DeclKind::Enum);
     }
 
@@ -307,7 +367,22 @@ mod tests {
         let r = extract(
             "<?php\nnamespace U;\nenum Operator: string\n{\n    private const X = 'x';\n    case A = 'a';\n}\n",
         );
-        let names: Vec<_> = r.iter().map(|d| d.fqcn.as_str()).collect();
-        assert!(names.contains(&"U\\Operator"));
+        assert!(fqcns(&r).contains(&"U\\Operator".to_string()));
+    }
+
+    #[test]
+    fn recovers_high_byte_class_name() {
+        // Symfony's vendor/symfony/cache/Traits/ValueWrapper.php declares
+        // `class <0xa9>` (a single Latin-1 ©). PHP identifiers legally allow
+        // \x80-\xff but tree-sitter-php parses such names as ERROR. Recovery
+        // must still extract them so we match Composer's classmap byte-for-
+        // byte (and so the class loads correctly at runtime).
+        let mut src: Vec<u8> = b"<?php\nclass ".to_vec();
+        src.push(0xa9);
+        src.extend_from_slice(b"\n{\n}\n");
+        let decls = PhpParser::new().extract(&src);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].fqcn, vec![0xa9]);
+        assert_eq!(decls[0].kind, DeclKind::Class);
     }
 }

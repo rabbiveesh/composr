@@ -28,60 +28,70 @@ use std::path::Path;
 pub fn admit(decl: &Declaration, file: &Path, source: &PhpSource) -> bool {
     match source {
         PhpSource::Classmap => true,
-        PhpSource::Psr4 { prefix, root } => psr4_strict_match(&decl.fqcn, prefix, root, file),
-        PhpSource::Psr0 { prefix, root } => psr0_match(&decl.fqcn, prefix, root, file),
+        PhpSource::Psr4 { prefix, root } => {
+            psr4_strict_match(&decl.fqcn, prefix.as_bytes(), root, file)
+        }
+        PhpSource::Psr0 { prefix, root } => {
+            psr0_match(&decl.fqcn, prefix.as_bytes(), root, file)
+        }
     }
 }
 
-fn psr4_strict_match(fqcn: &str, prefix: &str, root: &Path, file: &Path) -> bool {
+fn psr4_strict_match(fqcn: &[u8], prefix: &[u8], root: &Path, file: &Path) -> bool {
     let Ok(rel) = file.strip_prefix(root) else {
         return false;
     };
     let Some(rel_s) = rel.to_str() else {
         return false;
     };
-    // Drop the .php extension.
     let stem = rel_s.strip_suffix(".php").unwrap_or(rel_s);
-    // Convert path separator to namespace separator. We accept either / or \\
-    // since walk paths on macOS/Linux use /.
-    let class_part = stem.replace(std::path::MAIN_SEPARATOR, "\\");
-    let expected = format!("{}{}", prefix, class_part);
-    fqcn == expected
+    let mut expected: Vec<u8> = Vec::with_capacity(prefix.len() + stem.len());
+    expected.extend_from_slice(prefix);
+    for c in stem.chars() {
+        if c == std::path::MAIN_SEPARATOR {
+            expected.push(b'\\');
+        } else {
+            // ASCII path component, push raw byte (matches `c.to_string()`
+            // for the cases we care about; FQCN ASCII characters here come
+            // out of file paths which are guaranteed valid UTF-8 by `to_str`).
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            expected.extend_from_slice(s.as_bytes());
+        }
+    }
+    fqcn == expected.as_slice()
 }
 
-fn psr0_match(fqcn: &str, prefix: &str, root: &Path, file: &Path) -> bool {
-    // PSR-0 prefix is matched case-sensitively. The prefix in composer.json
-    // may or may not have a trailing `\\` — we already store it as the user
-    // wrote it, so check both forms via a startswith-after-normalization.
-    let prefix_norm = if prefix.ends_with('\\') {
-        prefix.to_string()
-    } else {
-        // Bare prefix (`HTMLPurifier`) — the class can be either
-        // `HTMLPurifier\…` or `HTMLPurifier_…` depending on namespacing style.
-        prefix.to_string()
-    };
-    let starts = fqcn.starts_with(&prefix_norm)
-        || (!prefix_norm.ends_with('\\')
-            && (fqcn.starts_with(&format!("{}\\", prefix_norm))
-                || fqcn.starts_with(&format!("{}_", prefix_norm))));
+fn psr0_match(fqcn: &[u8], prefix: &[u8], root: &Path, file: &Path) -> bool {
+    let starts = fqcn.starts_with(prefix)
+        || (!prefix.ends_with(b"\\") && {
+            let mut p_back = prefix.to_vec();
+            p_back.push(b'\\');
+            let mut p_under = prefix.to_vec();
+            p_under.push(b'_');
+            fqcn.starts_with(&p_back) || fqcn.starts_with(&p_under)
+        });
     if !starts {
         return false;
     }
 
-    // Now check the file path matches. PSR-0:
-    // namespace separators (`\`) and underscores in the *class name only*
-    // both map to directory separators.
-    let (ns, cls) = match fqcn.rsplit_once('\\') {
-        Some((n, c)) => (n, c),
-        None => ("", fqcn),
+    // PSR-0: namespace separators (`\`) and underscores in the *class name*
+    // (last `\\`-segment) both map to directory separators.
+    let (ns, cls) = match memrchr_byte(fqcn, b'\\') {
+        Some(idx) => (&fqcn[..idx], &fqcn[idx + 1..]),
+        None => (b"".as_slice(), fqcn),
     };
-    let mut expected_rel = String::new();
+    let mut expected_rel: Vec<u8> = Vec::new();
     if !ns.is_empty() {
-        expected_rel.push_str(&ns.replace('\\', "/"));
-        expected_rel.push('/');
+        for &b in ns {
+            expected_rel.push(if b == b'\\' { b'/' } else { b });
+        }
+        expected_rel.push(b'/');
     }
-    expected_rel.push_str(&cls.replace('_', "/"));
-    expected_rel.push_str(".php");
+    for &b in cls {
+        expected_rel.push(if b == b'_' { b'/' } else { b });
+    }
+    expected_rel.extend_from_slice(b".php");
 
     let Ok(rel) = file.strip_prefix(root) else {
         return false;
@@ -89,7 +99,11 @@ fn psr0_match(fqcn: &str, prefix: &str, root: &Path, file: &Path) -> bool {
     let Some(rel_s) = rel.to_str() else {
         return false;
     };
-    rel_s == expected_rel
+    rel_s.as_bytes() == expected_rel.as_slice()
+}
+
+fn memrchr_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    haystack.iter().rposition(|&b| b == needle)
 }
 
 #[cfg(test)]
@@ -100,7 +114,7 @@ mod tests {
 
     fn d(fqcn: &str) -> Declaration {
         Declaration {
-            fqcn: fqcn.to_string(),
+            fqcn: fqcn.as_bytes().to_vec(),
             kind: DeclKind::Class,
         }
     }

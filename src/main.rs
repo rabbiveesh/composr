@@ -175,7 +175,7 @@ fn run(cli: Cli) -> Result<i32> {
     let installed = cfg.vendor_dir.join("composer").join("InstalledVersions.php");
     if installed.is_file() {
         let mut m = map.lock().unwrap();
-        m.entry("Composer\\InstalledVersions".to_string())
+        m.entry(b"Composer\\InstalledVersions".to_vec())
             .or_insert(installed);
     }
 
@@ -239,7 +239,7 @@ fn write_outputs(
 
     // autoload_classmap.php — full rewrite.
     let classmap_php = render_classmap_php(map, root, vendor_dir);
-    write_atomic(&output_dir.join("autoload_classmap.php"), &classmap_php)?;
+    write_atomic_bytes(&output_dir.join("autoload_classmap.php"), &classmap_php)?;
 
     // autoload_static.php — surgical $classMap replacement. We always read
     // the *real* static.php from vendor/composer (the source of truth for
@@ -249,11 +249,13 @@ fn write_outputs(
     let real_static = vendor_dir.join("composer").join("autoload_static.php");
     let out_static = output_dir.join("autoload_static.php");
     if real_static.exists() {
-        let existing = std::fs::read_to_string(&real_static)
+        // Read as raw bytes — Composer's `$files` section can legally
+        // contain non-UTF-8 bytes as array keys (seen in the wild).
+        let existing = std::fs::read(&real_static)
             .with_context(|| format!("reading {}", real_static.display()))?;
         let body = render_static_classmap_body(map, root, vendor_dir);
         let updated = replace_static_classmap(&existing, &body)?;
-        write_atomic(&out_static, &updated)?;
+        write_atomic_bytes(&out_static, &updated)?;
     } else {
         tracing::warn!(
             "{} does not exist; skipping static autoload update — \
@@ -264,7 +266,7 @@ fn write_outputs(
     Ok(())
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+fn write_atomic_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     let tmp = path.with_extension("php.tmp");
     std::fs::write(&tmp, contents)
         .with_context(|| format!("writing {}", tmp.display()))?;
