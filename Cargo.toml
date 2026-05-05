@@ -1,0 +1,43 @@
+[package]
+name = "composer-classmap-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Fast, incremental Rust replacement for `composer dump-autoload -o`"
+license = "MIT"
+
+[[bin]]
+name = "composer-classmap-rs"
+path = "src/main.rs"
+
+[lib]
+name = "composer_classmap_rs"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ignore = "0.4"
+rayon = "1.10"
+tree-sitter = "0.22"
+tree-sitter-php = "0.22"
+bincode = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+globset = "0.4"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memchr = "2"
+fs2 = "0.4"
+num_cpus = "1"
+
+[dev-dependencies]
+tempfile = "3"
+pretty_assertions = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
