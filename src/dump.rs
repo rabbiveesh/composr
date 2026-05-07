@@ -37,7 +37,11 @@ pub struct DumpStats {
     pub elapsed_ms: u128,
 }
 
-pub fn dump(opts: DumpOptions) -> Result<DumpStats> {
+/// Compute the classmap without writing anything. Returned alongside the
+/// ResolvedConfig + DumpStats so callers (the bootstrap path in install.rs,
+/// in particular) can write a different shape of output without redoing the
+/// expensive walk + parse work.
+pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, DumpStats)> {
     let started = Instant::now();
     let root = opts.root.clone();
     let cache_path = opts.cache_path.clone().unwrap_or_else(|| {
@@ -136,25 +140,36 @@ pub fn dump(opts: DumpOptions) -> Result<DumpStats> {
 
     let map = map.into_inner().unwrap();
 
-    if !opts.dry_run {
-        let output_dir = opts
-            .output_dir
-            .clone()
-            .unwrap_or_else(|| cfg.vendor_dir.join("composer"));
-        write_outputs(&cfg.root, &cfg.vendor_dir, &output_dir, &map)?;
-        if !opts.no_cache {
-            cache.save(&cache_path)?;
-        }
+    if !opts.no_cache {
+        cache.save(&cache_path).ok();
     }
 
-    Ok(DumpStats {
+    let stats = DumpStats {
         walked: walked.len(),
         hits: hits.load(Ordering::Relaxed),
         misses: misses.load(Ordering::Relaxed),
         errors: errors.load(Ordering::Relaxed),
         classes: map.len(),
         elapsed_ms: started.elapsed().as_millis(),
-    })
+    };
+    Ok((cfg, map, stats))
+}
+
+/// Standalone dump-autoload — patches the existing autoload_static.php and
+/// rewrites autoload_classmap.php. Used for incremental updates where the
+/// bootstrap files already exist (the fast path).
+pub fn dump(opts: DumpOptions) -> Result<DumpStats> {
+    let dry_run = opts.dry_run;
+    let output_dir_override = opts.output_dir.clone();
+    let (cfg, map, stats) = build_classmap(&opts)?;
+
+    if !dry_run {
+        let output_dir =
+            output_dir_override.unwrap_or_else(|| cfg.vendor_dir.join("composer"));
+        write_outputs(&cfg.root, &cfg.vendor_dir, &output_dir, &map)?;
+    }
+
+    Ok(stats)
 }
 
 fn write_outputs(

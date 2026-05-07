@@ -19,12 +19,12 @@
 
 use crate::auth::AuthConfig;
 use crate::binsetup;
-use crate::composer_shim::{
-    bootstrap_complete, entries_need_composer, lock_needs_plugin_activation, Composer,
-};
+use crate::bootstrap::{write_bootstrap, BootstrapInput};
+use crate::composer_shim::{bootstrap_complete, entries_need_composer, Composer};
 use crate::diff::{compute_ops, Op};
 use crate::dist_cache::DistCache;
 use crate::download::{DownloadOutcome, Downloader};
+use crate::dump::{build_classmap, DumpOptions};
 use crate::extract::{extract_zip_to_install_path, install_path_package};
 use crate::installed::{
     build_installed_json, render_installed_php, write_installed_json,
@@ -335,38 +335,46 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         .with_context(|| format!("renaming into {}", installed_php_path.display()))?;
 
     // Autoload generation. Two paths:
-    //   - Bootstrap-needed (cold start), OR a non-inert plugin in the lock
-    //     AND we just changed vendor (added/removed packages, so plugin
-    //     state may be stale): delegate to `composer dump-autoload
-    //     --no-scripts -o`. composer rewrites the whole vendor/composer/
-    //     autoload tree AND fires plugin activation hooks for us.
-    //   - Otherwise: take the fast path — our existing classmap + static
-    //     patcher.
+    //   - Bootstrap-needed (cold start — autoload.php / ClassLoader.php /
+    //     etc. don't exist): generate the full bootstrap natively. We do
+    //     the same expensive classmap walk as dump-autoload, but emit
+    //     ALL the autoload_*.php files instead of just patching one.
+    //   - Otherwise: take the fast path — patch the existing
+    //     autoload_static.php and rewrite autoload_classmap.php.
     //
-    // Specifically: when nothing changed in vendor (a no-op install — the
-    // common CI case), we don't pay composer's startup cost just to
-    // re-activate plugins whose state hasn't changed.
+    // Plugin activation is no longer a delegation trigger — for the plugins
+    // we see in service-app/monolith-app (php-http/discovery, pestphp/pest-plugin,
+    // tbachert/spi) install-time hooks aren't load-bearing; their PHP
+    // code in vendor/ works at runtime without composer-side activation.
     let needs_bootstrap = !bootstrap_complete(&vendor_dir);
-    let vendor_changed = !installs.is_empty() || !removes.is_empty();
-    let needs_plugin_activation = lock_needs_plugin_activation(&lock) && vendor_changed;
-    let delegate_dump = (needs_bootstrap || needs_plugin_activation) && composer.is_some();
-    if delegate_dump {
-        let why = if needs_bootstrap && needs_plugin_activation {
-            "bootstrap files missing + plugin activation"
-        } else if needs_bootstrap {
-            "bootstrap files missing"
-        } else {
-            "plugin activation"
+    if needs_bootstrap {
+        tracing::info!("autoload bootstrap missing — generating natively");
+        let dump_opts = DumpOptions {
+            root: root.clone(),
+            cache_path: None,
+            with_dev: opts.dev,
+            no_cache: false,
+            dry_run: false,
+            output_dir: None,
         };
-        tracing::info!("delegating autoload to composer ({why})");
-        let outcome = composer
-            .as_ref()
-            .unwrap()
-            .dump_autoload(&root, &composer_env)?;
-        composer_calls += 1;
+        let (cfg, classmap, stats) = build_classmap(&dump_opts)
+            .context("computing classmap for bootstrap")?;
+        let suffix = lock
+            .content_hash
+            .clone()
+            .unwrap_or_else(|| crate::install::md5_hex_export(b"composr-fallback"));
+        write_bootstrap(&BootstrapInput {
+            root: &cfg.root,
+            vendor_dir: &cfg.vendor_dir,
+            packages: &cfg.packages,
+            classmap: &classmap,
+            suffix: &suffix,
+        })
+        .context("writing autoload bootstrap")?;
         tracing::info!(
-            "composer dump-autoload completed in {}ms",
-            outcome.elapsed_ms
+            "bootstrap written ({} classes, walk took {}ms)",
+            stats.classes,
+            stats.elapsed_ms
         );
     } else {
         crate::dump_autoload(&root, opts.dev)
@@ -565,6 +573,12 @@ fn composer_json_content_hash(path: &Path) -> Result<String> {
 /// advisory.
 fn md5_compute(input: &[u8]) -> Md5Digest {
     Md5Digest(md5_impl(input))
+}
+
+/// Hex-encoded md5. Public so other modules (bootstrap.rs, in particular)
+/// can reuse it without reimplementing or pulling in another crate.
+pub fn md5_hex_export(input: &[u8]) -> String {
+    format!("{:x}", md5_compute(input))
 }
 
 struct Md5Digest([u8; 16]);
