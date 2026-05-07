@@ -17,6 +17,114 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+/// Install a `dist.type == "path"` package: place a symlink at
+/// `install_path` pointing to the source directory. Composer's PathDownloader
+/// (PathDownloader.php) defaults to `relative: true, symlink: null`, meaning
+/// a relative symlink with mirror as a fallback when symlink fails. We mirror
+/// that policy.
+///
+/// `symlink_pref`:
+///   - `Some(true)`  → symlink only; error if it fails
+///   - `Some(false)` → mirror (recursive copy) only
+///   - `None`        → try symlink, fall back to mirror on error
+pub fn install_path_package(
+    source: &Path,
+    install_path: &Path,
+    relative: bool,
+    symlink_pref: Option<bool>,
+) -> Result<()> {
+    let canon_source = source.canonicalize().with_context(|| {
+        format!("resolving path-dist source {}", source.display())
+    })?;
+
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    // Wipe any existing target. Be careful with symlinks: removing the link,
+    // not the dir it points to.
+    if install_path.is_symlink() || install_path.is_file() {
+        fs::remove_file(install_path).with_context(|| {
+            format!("removing existing {}", install_path.display())
+        })?;
+    } else if install_path.exists() {
+        fs::remove_dir_all(install_path).with_context(|| {
+            format!("removing existing dir {}", install_path.display())
+        })?;
+    }
+
+    let try_symlink = || -> Result<()> {
+        let target: PathBuf = if relative {
+            let parent = install_path
+                .parent()
+                .ok_or_else(|| anyhow!("install path has no parent: {}", install_path.display()))?;
+            // Canonicalize the parent so we compare in the same path-prefix
+            // namespace as `canon_source` (matters on macOS where /var is a
+            // symlink to /private/var; otherwise we'd compute ../../../../...
+            // and walk past the filesystem root).
+            let canon_parent = parent.canonicalize().with_context(|| {
+                format!("canonicalizing install parent {}", parent.display())
+            })?;
+            PathBuf::from(path_relative_components(&canon_parent, &canon_source))
+        } else {
+            canon_source.clone()
+        };
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, install_path)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            // Fall through to mirror — symlinks on Windows need junctions
+            // and elevation that we don't bother with here.
+            Err(anyhow!("symlinks unsupported on this platform"))
+        }
+    };
+
+    let try_mirror = || -> Result<()> {
+        copy_dir_recursive(&canon_source, install_path)
+    };
+
+    match symlink_pref {
+        Some(true) => try_symlink().context("path package: symlink required and failed"),
+        Some(false) => try_mirror(),
+        None => match try_symlink() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "symlink for path package {} failed ({e}); mirroring instead",
+                    install_path.display()
+                );
+                try_mirror()
+            }
+        },
+    }
+}
+
+/// Compute a relative path from `from` to `to` as a forward-slash string.
+/// Both should be absolute. Used by `install_path_package` to mirror
+/// PathDownloader's `findShortestPath` behavior.
+fn path_relative_components(from: &Path, to: &Path) -> String {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let mut common = 0;
+    while common < from.len() && common < to.len() && from[common] == to[common] {
+        common += 1;
+    }
+    let ups = from.len() - common;
+    let mut parts: Vec<String> = (0..ups).map(|_| "..".to_string()).collect();
+    for c in to.iter().skip(common) {
+        parts.push(c.as_os_str().to_string_lossy().to_string());
+    }
+    if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
+    }
+}
+
 #[derive(Debug)]
 pub struct ExtractResult {
     pub install_path: PathBuf,
@@ -32,10 +140,14 @@ pub fn extract_zip_to_install_path(
     install_path: &Path,
     vendor_dir: &Path,
 ) -> Result<ExtractResult> {
-    // Empty the target dir if present, but only if it's not vendor or one
-    // of vendor's ancestors — we'd never install a package on top of vendor
-    // itself, but defending against pathological cases is cheap.
-    if install_path.exists() {
+    // Replace the existing install_path. CRITICAL: if it's a symlink (e.g.
+    // a path-dist install we're now switching to zip), only remove the link
+    // — never touch the link target, which is the user's source dir.
+    if install_path.is_symlink() {
+        fs::remove_file(install_path).with_context(|| {
+            format!("removing existing symlink {}", install_path.display())
+        })?;
+    } else if install_path.exists() {
         if vendor_dir.starts_with(install_path) {
             bail!(
                 "refusing to empty {} because vendor dir lives inside it",
@@ -319,6 +431,47 @@ mod tests {
 
         assert!(install.join("composer.json").is_file());
         assert!(install.join("src/X.php").is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_install_creates_relative_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        let source = proj.join("lib/local-pkg");
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/Foo.php"), b"<?php class Foo {}").unwrap();
+        fs::write(source.join("composer.json"), b"{}").unwrap();
+        let install = proj.join("vendor/acme/local-pkg");
+        install_path_package(&source, &install, true, None).unwrap();
+        assert!(install.is_symlink());
+        let target = fs::read_link(&install).unwrap();
+        // Should be relative.
+        assert!(target.is_relative(), "target {} should be relative", target.display());
+        // Resolve and verify file is reachable through the symlink.
+        assert!(install.join("src/Foo.php").exists());
+        assert!(install.join("composer.json").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_install_replaces_existing_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        let source_a = proj.join("lib/a");
+        let source_b = proj.join("lib/b");
+        fs::create_dir_all(&source_a).unwrap();
+        fs::create_dir_all(&source_b).unwrap();
+        fs::write(source_a.join("a.txt"), b"a").unwrap();
+        fs::write(source_b.join("b.txt"), b"b").unwrap();
+        let install = proj.join("vendor/x/y");
+        install_path_package(&source_a, &install, true, None).unwrap();
+        install_path_package(&source_b, &install, true, None).unwrap();
+        assert!(install.join("b.txt").exists());
+        assert!(!install.join("a.txt").exists());
+        // The original source_a must still have its file — symlink replace
+        // must not have followed the old link.
+        assert!(source_a.join("a.txt").exists());
     }
 
     #[test]

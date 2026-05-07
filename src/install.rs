@@ -21,7 +21,7 @@ use crate::auth::AuthConfig;
 use crate::diff::{compute_ops, Op};
 use crate::dist_cache::DistCache;
 use crate::download::{DownloadOutcome, Downloader};
-use crate::extract::extract_zip_to_install_path;
+use crate::extract::{extract_zip_to_install_path, install_path_package};
 use crate::installed::{
     build_installed_json, render_installed_php, write_installed_json, InstalledJson,
 };
@@ -174,10 +174,19 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         runner.dispatch(Lifecycle::PreInstallCmd)?;
     }
 
-    // Async download phase.
+    // Split installs by dist type. Only zip-dist packages need an HTTP
+    // fetch; path-dist packages get symlinked from a local source dir.
+    let (zip_installs, path_installs): (Vec<&LockedPackage>, Vec<&LockedPackage>) =
+        installs.iter().copied().partition(|p| {
+            p.dist
+                .as_ref()
+                .map(|d| d.kind != "path")
+                .unwrap_or(true)
+        });
+
     let cache = DistCache::discover(opts.cache_dir.clone())?;
     let auth = AuthConfig::load(&root)?;
-    let download_outcomes = if installs.is_empty() {
+    let download_outcomes = if zip_installs.is_empty() {
         Vec::new()
     } else {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -186,7 +195,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             .context("starting tokio runtime")?;
         let downloader = Downloader::new(cache.clone(), auth.clone(), opts.concurrency)?;
         runtime
-            .block_on(downloader.fetch_all(&installs, true))
+            .block_on(downloader.fetch_all(&zip_installs, true))
             .context("downloading dist archives")?
     };
     let cache_path_by_name: HashMap<String, &DownloadOutcome> = download_outcomes
@@ -203,14 +212,47 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         }
     }
 
-    // Installs.
-    for pkg in &installs {
+    // Zip installs.
+    for pkg in &zip_installs {
         let outcome = cache_path_by_name.get(&pkg.name).ok_or_else(|| {
             anyhow!("internal: no download outcome for {}", pkg.name)
         })?;
         let install_path = vendor_dir.join(&pkg.name);
         extract_zip_to_install_path(&outcome.cached_path, &install_path, &vendor_dir)
             .with_context(|| format!("extracting {}", pkg.name))?;
+        binsetup::install_package_bins(
+            &pkg.name,
+            &install_path,
+            &pkg.bin,
+            &bin_dir,
+            &vendor_dir,
+        )?;
+    }
+
+    // Path installs (local sibling dirs from `repositories[type=path]`).
+    // Default to relative symlinks per Composer's PathDownloader.
+    for pkg in &path_installs {
+        let dist = pkg.dist.as_ref().ok_or_else(|| {
+            anyhow!("path package {} has no dist entry", pkg.name)
+        })?;
+        let source_rel = Path::new(&dist.url);
+        let source_abs: PathBuf = if source_rel.is_absolute() {
+            source_rel.to_path_buf()
+        } else {
+            root.join(source_rel)
+        };
+        if !source_abs.exists() {
+            bail!(
+                "path package {}: source {} not found",
+                pkg.name,
+                source_abs.display()
+            );
+        }
+        let install_path = vendor_dir.join(&pkg.name);
+        let relative = pkg.transport_options.relative.unwrap_or(true);
+        let symlink_pref = pkg.transport_options.symlink;
+        install_path_package(&source_abs, &install_path, relative, symlink_pref)
+            .with_context(|| format!("installing path package {}", pkg.name))?;
         binsetup::install_package_bins(
             &pkg.name,
             &install_path,
@@ -283,14 +325,17 @@ fn apply_remove(
     binsetup::remove_package_bins(&bins, bin_dir)?;
 
     let dir = vendor_dir.join(name);
-    if dir.exists() {
+    if dir.is_symlink() {
+        std::fs::remove_file(&dir)
+            .with_context(|| format!("unlink {}", dir.display()))?;
+    } else if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("rm -rf {}", dir.display()))?;
-        // Try to remove the now-empty vendor parent (e.g. vendor/acme).
-        if let Some(parent) = dir.parent() {
-            if parent != vendor_dir {
-                let _ = std::fs::remove_dir(parent);
-            }
+    }
+    // Try to remove the now-empty vendor parent (e.g. vendor/acme).
+    if let Some(parent) = dir.parent() {
+        if parent != vendor_dir {
+            let _ = std::fs::remove_dir(parent);
         }
     }
     Ok(())

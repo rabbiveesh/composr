@@ -51,6 +51,17 @@ pub struct LockedPackage {
     pub bin: Vec<String>,
     /// Whether this package was listed in `packages-dev`.
     pub dev: bool,
+    /// Per-package transport options. For `dist.type == "path"` packages,
+    /// `relative` (default true) controls whether the symlink target is
+    /// relative; `symlink` (default null = "try symlink, mirror on failure")
+    /// controls strategy.
+    pub transport_options: TransportOptions,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransportOptions {
+    pub relative: Option<bool>,
+    pub symlink: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +195,15 @@ fn parse_package(v: Value, dev: bool) -> Result<LockedPackage> {
         })
         .unwrap_or_default();
 
+    let transport_options = obj
+        .get("transport-options")
+        .and_then(|t| t.as_object())
+        .map(|t| TransportOptions {
+            relative: t.get("relative").and_then(|x| x.as_bool()),
+            symlink: t.get("symlink").and_then(|x| x.as_bool()),
+        })
+        .unwrap_or_default();
+
     Ok(LockedPackage {
         raw: v,
         name,
@@ -192,6 +212,7 @@ fn parse_package(v: Value, dev: bool) -> Result<LockedPackage> {
         dist,
         bin,
         dev,
+        transport_options,
     })
 }
 
