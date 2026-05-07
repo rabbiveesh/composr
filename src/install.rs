@@ -18,6 +18,10 @@
 //! pestphp/pest-plugin) the runtime parts continue to function.
 
 use crate::auth::AuthConfig;
+use crate::binsetup;
+use crate::composer_shim::{
+    bootstrap_complete, entries_need_composer, lock_needs_plugin_activation, Composer,
+};
 use crate::diff::{compute_ops, Op};
 use crate::dist_cache::DistCache;
 use crate::download::{DownloadOutcome, Downloader};
@@ -27,7 +31,6 @@ use crate::installed::{
 };
 use crate::lock::{Lock, LockedPackage};
 use crate::scripts::{Lifecycle, Runner};
-use crate::binsetup;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -45,6 +48,13 @@ pub struct InstallOptions {
     /// If true, abort if any composer-plugin is in the lock. Default: install
     /// them as inert libraries with a warning.
     pub strict_plugins: bool,
+    /// If true, never shell out to composer — use the pure-Rust path even
+    /// when bootstrap files are missing or class-method scripts exist
+    /// (those will be skipped with warnings, as in the pre-delegation v1).
+    pub no_composer: bool,
+    /// Override path to the composer binary. If unset, we look at
+    /// AUTOLOAD_DUMPR_COMPOSER and then PATH.
+    pub composer_bin: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -54,6 +64,10 @@ pub struct InstallReport {
     pub from_cache: usize,
     pub fetched: usize,
     pub elapsed_ms: u128,
+    /// Number of times we shelled out to composer (bootstrap +
+    /// class-method-script events). Useful for confirming the hot path
+    /// stayed on the fast track for incremental installs.
+    pub composer_calls: usize,
 }
 
 pub fn run(opts: InstallOptions) -> Result<InstallReport> {
@@ -157,6 +171,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             from_cache: 0,
             fetched: 0,
             elapsed_ms: started.elapsed().as_millis(),
+            composer_calls: 0,
         });
     }
 
@@ -170,8 +185,33 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         scripts: &scripts_section,
     };
 
+    // Locate composer once up front. If it isn't reachable we proceed
+    // native-only (the user opted into hybrid mode but we can't satisfy it).
+    let composer = if opts.no_composer {
+        None
+    } else {
+        let c = Composer::locate(opts.composer_bin.as_deref());
+        if c.is_none() {
+            tracing::warn!(
+                "no `composer` binary on PATH (set AUTOLOAD_DUMPR_COMPOSER or pass --composer-bin); \
+                 running in pure-native mode — class-method scripts and missing autoload bootstrap files won't be handled"
+            );
+        }
+        c
+    };
+    let mut composer_calls: usize = 0;
+    let composer_env = composer_passthrough_env();
+
     if !opts.no_scripts {
-        runner.dispatch(Lifecycle::PreInstallCmd)?;
+        run_event(
+            Lifecycle::PreInstallCmd,
+            &runner,
+            &scripts_section,
+            composer.as_ref(),
+            &root,
+            &composer_env,
+            &mut composer_calls,
+        )?;
     }
 
     // Split installs by dist type. Only zip-dist packages need an HTTP
@@ -288,14 +328,64 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     std::fs::rename(&installed_php_tmp, &installed_php_path)
         .with_context(|| format!("renaming into {}", installed_php_path.display()))?;
 
-    // Hand off to the existing dump-autoload pipeline. We invoke the same
-    // entry points so the cache, parser, and emit logic stay shared.
-    crate::dump_autoload(&root, opts.dev)
-        .context("running dump-autoload after install")?;
+    // Autoload generation. Two paths:
+    //   - Bootstrap-needed (cold start), OR a non-inert plugin in the lock
+    //     AND we just changed vendor (added/removed packages, so plugin
+    //     state may be stale): delegate to `composer dump-autoload
+    //     --no-scripts -o`. composer rewrites the whole vendor/composer/
+    //     autoload tree AND fires plugin activation hooks for us.
+    //   - Otherwise: take the fast path — our existing classmap + static
+    //     patcher.
+    //
+    // Specifically: when nothing changed in vendor (a no-op install — the
+    // common CI case), we don't pay composer's startup cost just to
+    // re-activate plugins whose state hasn't changed.
+    let needs_bootstrap = !bootstrap_complete(&vendor_dir);
+    let vendor_changed = !installs.is_empty() || !removes.is_empty();
+    let needs_plugin_activation = lock_needs_plugin_activation(&lock) && vendor_changed;
+    let delegate_dump = (needs_bootstrap || needs_plugin_activation) && composer.is_some();
+    if delegate_dump {
+        let why = if needs_bootstrap && needs_plugin_activation {
+            "bootstrap files missing + plugin activation"
+        } else if needs_bootstrap {
+            "bootstrap files missing"
+        } else {
+            "plugin activation"
+        };
+        tracing::info!("delegating autoload to composer ({why})");
+        let outcome = composer
+            .as_ref()
+            .unwrap()
+            .dump_autoload(&root, &composer_env)?;
+        composer_calls += 1;
+        tracing::info!(
+            "composer dump-autoload completed in {}ms",
+            outcome.elapsed_ms
+        );
+    } else {
+        crate::dump_autoload(&root, opts.dev)
+            .context("running dump-autoload after install")?;
+    }
 
     if !opts.no_scripts {
-        runner.dispatch(Lifecycle::PostAutoloadDump)?;
-        runner.dispatch(Lifecycle::PostInstallCmd)?;
+        run_event(
+            Lifecycle::PostAutoloadDump,
+            &runner,
+            &scripts_section,
+            composer.as_ref(),
+            &root,
+            &composer_env,
+            &mut composer_calls,
+        )?;
+        run_event(
+            Lifecycle::PostInstallCmd,
+            &runner,
+            &scripts_section,
+            composer.as_ref(),
+            &root,
+            &composer_env,
+            &mut composer_calls,
+        )?;
     }
 
     Ok(InstallReport {
@@ -304,7 +394,86 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         from_cache,
         fetched,
         elapsed_ms: started.elapsed().as_millis(),
+        composer_calls,
     })
+}
+
+/// Run one lifecycle event. If the event has class-method entries (which
+/// require composer's EventDispatcher to dispatch correctly), shell out to
+/// `composer run-script <event>`. Otherwise use our native runner.
+fn run_event(
+    event: Lifecycle,
+    runner: &Runner,
+    scripts_section: &Value,
+    composer: Option<&Composer>,
+    cwd: &std::path::Path,
+    env: &HashMap<String, String>,
+    composer_calls: &mut usize,
+) -> Result<()> {
+    let key = event.key();
+    let entries = match scripts_section.get(key) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    if entries_need_composer(entries) {
+        match composer {
+            Some(c) => {
+                tracing::info!("delegating {key} to composer (class-method handler present)");
+                let outcome = c.run_script(cwd, env, key)?;
+                *composer_calls += 1;
+                tracing::info!(
+                    "composer run-script {key} completed in {}ms",
+                    outcome.elapsed_ms
+                );
+                return Ok(());
+            }
+            None => {
+                tracing::warn!(
+                    "{key} has class-method handler but no composer available; falling back to native runner (handler will be skipped)"
+                );
+            }
+        }
+    }
+    runner.dispatch(event)?;
+    Ok(())
+}
+
+/// Build the env we hand to composer when delegating. Composer reads
+/// `COMPOSER_AUTH`, `COMPOSER_HOME`, `COMPOSER_CACHE_DIR`, etc.; if those
+/// were set in our process we want them propagated. We also synthesize
+/// `COMPOSER_AUTH` from `GH_TOKEN`/`GITHUB_TOKEN` when the user gave us a
+/// token but didn't construct the auth blob themselves.
+fn composer_passthrough_env() -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = HashMap::new();
+    for var in [
+        "COMPOSER_AUTH",
+        "COMPOSER_HOME",
+        "COMPOSER_CACHE_DIR",
+        "COMPOSER_PROCESS_TIMEOUT",
+        "COMPOSER_DISABLE_NETWORK",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "PATH",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            env.insert(var.to_string(), v);
+        }
+    }
+    if !env.contains_key("COMPOSER_AUTH") {
+        let token = env
+            .get("GH_TOKEN")
+            .or_else(|| env.get("GITHUB_TOKEN"))
+            .cloned();
+        if let Some(t) = token {
+            if !t.is_empty() {
+                env.insert(
+                    "COMPOSER_AUTH".into(),
+                    format!("{{\"github-oauth\":{{\"github.com\":\"{t}\"}}}}"),
+                );
+            }
+        }
+    }
+    env
 }
 
 fn apply_remove(

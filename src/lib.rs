@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod binsetup;
 pub mod cache;
+pub mod composer_shim;
 pub mod config;
 pub mod diff;
 pub mod dist_cache;

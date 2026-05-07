@@ -71,6 +71,14 @@ struct InstallArgs {
     /// Refuse to install if any composer-plugin is in the lock.
     #[arg(long)]
     strict_plugins: bool,
+    /// Never shell out to composer — pure-native install. Class-method
+    /// scripts and missing autoload bootstrap files won't be handled.
+    #[arg(long)]
+    no_composer: bool,
+    /// Override the composer binary path used for delegation. If unset,
+    /// AUTOLOAD_DUMPR_COMPOSER and PATH are checked.
+    #[arg(long)]
+    composer_bin: Option<PathBuf>,
 }
 
 fn main() {
@@ -151,14 +159,18 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 concurrency,
                 cache_dir: args.cache_dir,
                 strict_plugins: args.strict_plugins,
+                no_composer: args.no_composer,
+                composer_bin: args.composer_bin,
             })?;
             eprintln!(
-                "install: {} installed, {} removed ({} cached, {} fetched) in {}ms",
+                "install: {} installed, {} removed ({} cached, {} fetched) in {}ms ({} composer call{})",
                 report.installed,
                 report.removed,
                 report.from_cache,
                 report.fetched,
-                report.elapsed_ms
+                report.elapsed_ms,
+                report.composer_calls,
+                if report.composer_calls == 1 { "" } else { "s" }
             );
             Ok(0)
         }

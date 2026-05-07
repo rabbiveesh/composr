@@ -63,11 +63,19 @@ pub fn replace_static_classmap(existing: &[u8], new_body: &[u8]) -> Result<Vec<u
     let nl_off = memchr::memchr(b'\n', &existing[start..])
         .context("malformed $classMap opening line")?;
     let after_open = start + nl_off + 1;
-    // Find the closing `    );` line.
-    let close_marker: &[u8] = b"\n    );";
-    let close_rel = memchr_find(&existing[after_open..], close_marker)
-        .context("autoload_static.php $classMap section has no closing `    );`")?;
-    let close = after_open + close_rel + 1; // point at `    );`
+    // Find the closing `    );` line. Two shapes to accept:
+    //   1) `<entries...>\n    );` — the normal case with at least one entry
+    //   2) `    );` immediately at after_open — composer-like file with an
+    //      empty class map (rare in real projects, but happens with stubbed
+    //      or freshly bootstrapped files).
+    let close = if existing[after_open..].starts_with(b"    );") {
+        after_open
+    } else {
+        let close_marker: &[u8] = b"\n    );";
+        let close_rel = memchr_find(&existing[after_open..], close_marker)
+            .context("autoload_static.php $classMap section has no closing `    );`")?;
+        after_open + close_rel + 1
+    };
 
     let mut out = Vec::with_capacity(existing.len() - (close - after_open) + new_body.len());
     out.extend_from_slice(&existing[..after_open]);
