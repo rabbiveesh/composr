@@ -723,10 +723,36 @@ fn apply_remove(
 }
 
 /// Compute the content-hash composer uses to compare composer.json against
-/// composer.lock. Composer's algorithm: take a stable subset of fields
-/// (require, require-dev, conflict, replace, provide, minimum-stability,
-/// prefer-stable, repositories, extra), JSON-encode them with
-/// JSON_UNESCAPED_SLASHES + JSON_UNESCAPED_UNICODE, then md5.
+/// composer.lock — byte-for-byte compatible with PHP's
+/// `Composer\Package\Locker::getContentHash`:
+///
+/// ```php
+/// $content = json_decode($composerFileContents, true);
+/// $relevantKeys = [
+///     'name', 'version', 'require', 'require-dev', 'conflict', 'replace',
+///     'provide', 'minimum-stability', 'prefer-stable', 'repositories', 'extra',
+/// ];
+/// $relevantContent = [];
+/// foreach (array_intersect($relevantKeys, array_keys($content)) as $key) {
+///     $relevantContent[$key] = $content[$key];
+/// }
+/// if (isset($content['config']['platform'])) {
+///     $relevantContent['config']['platform'] = $content['config']['platform'];
+/// }
+/// ksort($relevantContent);
+/// return md5(JsonFile::encode($relevantContent, 0));
+/// ```
+///
+/// Two divergences from `serde_json::to_string` we have to handle to match
+/// PHP's `json_encode($x, JSON_THROW_ON_ERROR)` (i.e. options=0 — none of
+/// `JSON_UNESCAPED_SLASHES`, `JSON_UNESCAPED_UNICODE`, `JSON_PRETTY_PRINT`):
+///
+///   1. `/` is escaped as `\/`.
+///   2. Non-ASCII characters are escaped as `\uXXXX` (surrogate pairs for
+///      supplementary-plane code points), not emitted as raw UTF-8.
+///
+/// Inner object key order mirrors the JSON file's order — `serde_json` with
+/// the `preserve_order` feature already does this for us.
 fn composer_json_content_hash(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading {}", path.display()))?;
@@ -744,27 +770,131 @@ fn composer_json_content_hash(path: &Path) -> Result<String> {
         "repositories",
         "extra",
     ];
-    let mut subset = serde_json::Map::new();
+
+    // Build the subset, then sort top-level keys alphabetically (composer
+    // calls `ksort` on the array right before encoding).
+    let mut subset: Vec<(String, Value)> = Vec::new();
     if let Some(obj) = v.as_object() {
         for k in &relevant_keys {
             if let Some(val) = obj.get(*k) {
-                subset.insert((*k).to_string(), val.clone());
+                subset.push(((*k).to_string(), val.clone()));
             }
         }
     }
-    // PHP's JSON_UNESCAPED_SLASHES + JSON_UNESCAPED_UNICODE — serde_json
-    // matches both by default for non-ASCII; slashes also aren't escaped.
-    // JSON object key order: we mirror Composer by emitting keys in the
-    // order they appeared above (they're stable).
+    if let Some(platform) = v
+        .get("config")
+        .and_then(|c| c.get("platform"))
+        .cloned()
+    {
+        let mut config_obj = serde_json::Map::new();
+        config_obj.insert("platform".to_string(), platform);
+        subset.push(("config".to_string(), Value::Object(config_obj)));
+    }
+    subset.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Insertion order is preserved (preserve_order feature → IndexMap), so
+    // iteration during encode also follows alphabetical order at the top.
     let mut ordered = serde_json::Map::new();
-    for k in &relevant_keys {
-        if let Some(val) = subset.remove(*k) {
-            ordered.insert((*k).to_string(), val);
+    for (k, val) in subset {
+        ordered.insert(k, val);
+    }
+
+    let mut json = String::with_capacity(bytes.len());
+    php_json_encode(&Value::Object(ordered), &mut json);
+    Ok(format!("{:x}", md5_compute(json.as_bytes())))
+}
+
+/// PHP-compatible `json_encode($x, JSON_THROW_ON_ERROR)` for the subset of
+/// JSON we care about (composer.json content). The cases we deliberately
+/// don't handle: floats with non-trivial representations, NaN/Infinity
+/// (PHP refuses these). composer.json doesn't contain any.
+fn php_json_encode(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(n) => {
+            // serde_json's Display matches PHP's `json_encode` for the
+            // representations that appear in composer.json (small
+            // integers, the rare float).
+            out.push_str(&n.to_string());
+        }
+        Value::String(s) => php_json_encode_string(s, out),
+        Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                php_json_encode(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            // PHP gotcha: `json_decode('{}', true)` produces an empty
+            // associative array `[]`, and `json_encode([])` emits `[]`,
+            // not `{}`. So the canonical PHP round-trip turns every
+            // empty object into an empty array. composer.json hits this
+            // on shapes like `extra: { "laravel": {} }` (the `laravel`
+            // sub-key is empty for projects that have no auto-discovery
+            // overrides). Match the PHP behavior.
+            if map.is_empty() {
+                out.push_str("[]");
+            } else {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    php_json_encode_string(k, out);
+                    out.push(':');
+                    php_json_encode(v, out);
+                }
+                out.push('}');
+            }
         }
     }
-    let json = serde_json::to_string(&Value::Object(ordered))
-        .context("serializing composer.json subset")?;
-    Ok(format!("{:x}", md5_compute(json.as_bytes())))
+}
+
+/// Encode a string the way PHP's `json_encode` does with options=0:
+/// double-quoted, with `\/`, `\u00XX` for control chars, named escapes
+/// for `\b\t\n\f\r"`, and `\uXXXX` for any code point above 0x7F
+/// (surrogate pair for supplementary-plane).
+fn php_json_encode_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '/' => out.push_str("\\/"),
+            '\x08' => out.push_str("\\b"),
+            '\x09' => out.push_str("\\t"),
+            '\x0a' => out.push_str("\\n"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0d' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c if (c as u32) < 0x80 => {
+                out.push(c);
+            }
+            c => {
+                use std::fmt::Write;
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    let _ = write!(out, "\\u{:04x}", cp);
+                } else {
+                    // Encode as UTF-16 surrogate pair (PHP json_encode does this).
+                    let v = cp - 0x10000;
+                    let high = 0xD800 + (v >> 10);
+                    let low = 0xDC00 + (v & 0x3FF);
+                    let _ = write!(out, "\\u{:04x}\\u{:04x}", high, low);
+                }
+            }
+        }
+    }
+    out.push('"');
 }
 
 /// Pure-Rust md5. We only use it for the content-hash check, which is
@@ -922,6 +1052,121 @@ mod tests {
             parse_package_discover("@composer dump-autoload", root),
             None
         );
+    }
+
+    #[test]
+    fn php_json_encodes_string_like_php_json_encode() {
+        let mut out = String::new();
+        php_json_encode_string("hello", &mut out);
+        assert_eq!(out, "\"hello\"");
+
+        let mut out = String::new();
+        php_json_encode_string("https://example.com/x", &mut out);
+        // `/` escaped as `\/`, matches PHP default.
+        assert_eq!(out, "\"https:\\/\\/example.com\\/x\"");
+
+        let mut out = String::new();
+        php_json_encode_string("ñ", &mut out);
+        // U+00F1 → ñ (lowercase hex).
+        assert_eq!(out, "\"\\u00f1\"");
+
+        let mut out = String::new();
+        php_json_encode_string("\"\\\n\t", &mut out);
+        assert_eq!(out, "\"\\\"\\\\\\n\\t\"");
+
+        // Supplementary plane → surrogate pair. U+1F600 = 😀.
+        let mut out = String::new();
+        php_json_encode_string("😀", &mut out);
+        assert_eq!(out, "\"\\ud83d\\ude00\"");
+    }
+
+    #[test]
+    fn php_json_encode_compact_object_matches_php_default() {
+        let v = serde_json::json!({ "a": 1, "b": [true, false, null] });
+        let mut out = String::new();
+        php_json_encode(&v, &mut out);
+        // Compact, no whitespace, no trailing newline. Mirrors
+        // `json_encode($x, JSON_THROW_ON_ERROR)`.
+        assert_eq!(out, r#"{"a":1,"b":[true,false,null]}"#);
+    }
+
+    /// Helper for hash tests: write `body` to a tempfile and compute the
+    /// content-hash. Each fixture is hand-verifiable: take the expected
+    /// PHP-encoded byte string in the assertion comment, pipe it through
+    /// `md5` (or any md5sum tool), and you should get the asserted hex.
+    fn hash_of_fixture(body: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("composer.json");
+        std::fs::write(&path, body).unwrap();
+        composer_json_content_hash(&path).unwrap()
+    }
+
+    #[test]
+    fn content_hash_simple_name_and_require() {
+        // Expected encoded bytes:  {"name":"a\/b","require":{"x\/y":"1"}}
+        // printf '%s' '{"name":"a\/b","require":{"x\/y":"1"}}' | md5
+        //   → 449f936eb3249b5f3a7b1fbd13173062
+        let h = hash_of_fixture(r#"{"name":"a/b","require":{"x/y":"1"}}"#);
+        assert_eq!(h, "449f936eb3249b5f3a7b1fbd13173062");
+    }
+
+    #[test]
+    fn content_hash_ignores_non_relevant_keys() {
+        // `description` and `authors` aren't in the relevant-keys subset
+        // and must be dropped before encode. Expected encoded bytes:
+        //   {"name":"a\/b"}
+        // → 7f686f5492b90e6f7c1f5878e6f3e259
+        let h = hash_of_fixture(
+            r#"{"description":"ignored","authors":[{"name":"x"}],"name":"a/b"}"#,
+        );
+        assert_eq!(h, "7f686f5492b90e6f7c1f5878e6f3e259");
+    }
+
+    #[test]
+    fn content_hash_ksorts_top_level_preserves_inner_order_escapes_unicode() {
+        // The big one — exercises every non-trivial part of the algorithm:
+        //
+        //   * Top-level keys appear in JSON order `extra,name,require`,
+        //     but composer ksorts them → output order alphabetical:
+        //     `extra,name,require`. (It happens to already be alphabetical
+        //     here; an explicit non-alphabetical input is in the next test.)
+        //   * Inner `require` keys stay in the JSON file's declared order
+        //     (`z` before `a`) — composer doesn't re-sort below the top level.
+        //   * The non-ASCII `ñ` (U+00F1) is escaped as `ñ` lowercase.
+        //
+        // Expected encoded bytes:
+        //   {"extra":{"k":"ñ"},"name":"a","require":{"z":"1","a":"2"}}
+        // → bd4eeb8dd78f7a60fd458e459a17826a
+        let h = hash_of_fixture(
+            "{\"extra\":{\"k\":\"\u{00f1}\"},\"name\":\"a\",\"require\":{\"z\":\"1\",\"a\":\"2\"}}",
+        );
+        assert_eq!(h, "bd4eeb8dd78f7a60fd458e459a17826a");
+    }
+
+    #[test]
+    fn content_hash_empty_object_becomes_empty_array() {
+        // PHP-ism: `json_decode('{}', true)` produces an empty array,
+        // and `json_encode([])` emits `[]`. So a `{"laravel": {}}` in
+        // the source composer.json contributes `"laravel":[]` (not
+        // `{}`) to the hashed bytes. Real-world: monolith-app's
+        // `extra.laravel = {}` killed the original implementation.
+        //
+        // Expected encoded bytes:
+        //   {"extra":{"laravel":[]},"name":"a\/b"}
+        // → f4c9576fde00a3b42ca3ac725fb5b375
+        let h = hash_of_fixture(r#"{"name":"a/b","extra":{"laravel":{}}}"#);
+        assert_eq!(h, "f4c9576fde00a3b42ca3ac725fb5b375");
+    }
+
+    #[test]
+    fn content_hash_ksort_reorders_non_alphabetical_top_level() {
+        // Same payload as the previous test but with `name` first in the
+        // input JSON. After ksort we still emit `extra,name,require` →
+        // identical hash to the previous test.
+        let h = hash_of_fixture(
+            "{\"name\":\"a\",\"extra\":{\"k\":\"\u{00f1}\"},\"require\":{\"z\":\"1\",\"a\":\"2\"}}",
+        );
+        assert_eq!(h, "bd4eeb8dd78f7a60fd458e459a17826a");
     }
 
     #[test]
