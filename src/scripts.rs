@@ -107,7 +107,7 @@ impl<'a> Runner<'a> {
 
         // @composer X : we'd need a real composer to run sub-scripts. Skip.
         if cmd.starts_with("@composer ") || cmd == "@composer" {
-            tracing::warn!("skipping `{cmd}` — autoload-dumpr does not invoke composer");
+            tracing::warn!("skipping `{cmd}` — composr does not recursively invoke composer");
             outcome.skipped += 1;
             return Ok(());
         }

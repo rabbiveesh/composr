@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
-use autoload_dumpr::dump::{dump as run_dump, DumpOptions};
-use autoload_dumpr::install::{run as run_install, InstallOptions};
+use composr::dump::{dump as run_dump, DumpOptions};
+use composr::install::{run as run_install, InstallOptions};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autoload-dumpr",
-    about = "Fast Rust replacement for `composer dump-autoload -o` and `composer install`",
+    name = "composr",
+    about = "Fast Rust install + dump-autoload for Composer projects (vowels not included)",
     arg_required_else_help = false
 )]
 struct Cli {
@@ -76,7 +76,7 @@ struct InstallArgs {
     #[arg(long)]
     no_composer: bool,
     /// Override the composer binary path used for delegation. If unset,
-    /// AUTOLOAD_DUMPR_COMPOSER and PATH are checked.
+    /// COMPOSR_COMPOSER (or legacy AUTOLOAD_DUMPR_COMPOSER) and PATH are checked.
     #[arg(long)]
     composer_bin: Option<PathBuf>,
 }

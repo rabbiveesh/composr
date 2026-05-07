@@ -36,7 +36,7 @@ pub struct Downloader {
 impl Downloader {
     pub fn new(cache: DistCache, auth: AuthConfig, concurrency: usize) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent("autoload-dumpr/0.1 (+https://github.com/anthropic) reqwest")
+            .user_agent("composr/0.2 (+https://github.com/anthropic) reqwest")
             .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(8)
@@ -147,7 +147,7 @@ async fn fetch_one(
     DistCache::ensure_parent(&cached_path)?;
 
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static("autoload-dumpr/0.1"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("composr/0.2"));
     if let Some(h) = auth_header {
         let mut hv = HeaderValue::from_str(h)
             .map_err(|e| anyhow!("invalid auth header: {e}"))?;

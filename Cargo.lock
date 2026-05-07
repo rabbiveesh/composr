@@ -101,39 +101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "autoload-dumpr"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "clap",
- "fs2",
- "futures",
- "globset",
- "hex",
- "ignore",
- "indicatif",
- "memchr",
- "num_cpus",
- "pretty_assertions",
- "rayon",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-php",
- "url",
- "zip",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,6 +249,39 @@ name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+
+[[package]]
+name = "composr"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "fs2",
+ "futures",
+ "globset",
+ "hex",
+ "ignore",
+ "indicatif",
+ "memchr",
+ "num_cpus",
+ "pretty_assertions",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-php",
+ "url",
+ "zip",
+]
 
 [[package]]
 name = "compression-codecs"

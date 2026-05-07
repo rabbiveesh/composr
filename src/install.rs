@@ -53,7 +53,7 @@ pub struct InstallOptions {
     /// (those will be skipped with warnings, as in the pre-delegation v1).
     pub no_composer: bool,
     /// Override path to the composer binary. If unset, we look at
-    /// AUTOLOAD_DUMPR_COMPOSER and then PATH.
+    /// COMPOSR_COMPOSER (or legacy AUTOLOAD_DUMPR_COMPOSER) and then PATH.
     pub composer_bin: Option<PathBuf>,
 }
 

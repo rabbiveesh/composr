@@ -8,7 +8,7 @@
 //!
 //! Resolution order for which binary to run:
 //!   1. `--composer-bin <path>` (caller-provided)
-//!   2. `AUTOLOAD_DUMPR_COMPOSER` env var
+//!   2. `COMPOSR_COMPOSER` env var (or legacy `AUTOLOAD_DUMPR_COMPOSER`)
 //!   3. `composer` on PATH
 //!
 //! If none is found, callers MUST treat delegation as a no-op (with a clear
@@ -36,11 +36,13 @@ impl Composer {
                 });
             }
         }
-        if let Ok(p) = std::env::var("AUTOLOAD_DUMPR_COMPOSER") {
-            if !p.is_empty() {
-                let pb = PathBuf::from(p);
-                if pb.exists() {
-                    return Some(Self { binary: pb });
+        for var in ["COMPOSR_COMPOSER", "AUTOLOAD_DUMPR_COMPOSER"] {
+            if let Ok(p) = std::env::var(var) {
+                if !p.is_empty() {
+                    let pb = PathBuf::from(p);
+                    if pb.exists() {
+                        return Some(Self { binary: pb });
+                    }
                 }
             }
         }

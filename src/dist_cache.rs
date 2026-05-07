@@ -2,7 +2,11 @@
 //!
 //! We use Composer's cache key shape — `<package>/<sha1(url)>.<ext>` — so the
 //! cache is conceptually shareable with Composer down the road. Path: under
-//! `$XDG_CACHE_HOME/autoload-dumpr/files/` (or `~/.cache/...` fallback).
+//! `$XDG_CACHE_HOME/composr/files/` (or `~/.cache/...` fallback).
+//!
+//! Backwards compat: when no override is set and the new default is empty
+//! but the old `~/.cache/autoload-dumpr/files/` exists with content, we
+//! reuse it (avoids a re-download on rename day).
 
 use anyhow::{Context, Result};
 use sha1::{Digest, Sha1};
@@ -15,17 +19,23 @@ pub struct DistCache {
 
 impl DistCache {
     /// Resolve the cache directory.
-    /// Override order: `--cache-dir` flag (caller-provided) > `AUTOLOAD_DUMPR_CACHE_DIR`
-    /// > `$XDG_CACHE_HOME/autoload-dumpr/files` > `$HOME/.cache/autoload-dumpr/files`.
+    /// Override order:
+    ///   1. `--cache-dir` (caller-provided)
+    ///   2. `COMPOSR_CACHE_DIR` env (or legacy `AUTOLOAD_DUMPR_CACHE_DIR`)
+    ///   3. `$XDG_CACHE_HOME/composr/files`, falling back to the legacy
+    ///      `autoload-dumpr` path if it exists and the new one doesn't.
+    ///   4. `$HOME/.cache/composr/files` (with the same legacy fallback).
     pub fn discover(explicit: Option<PathBuf>) -> Result<Self> {
         if let Some(p) = explicit {
             return Ok(Self { root: p });
         }
-        if let Ok(p) = std::env::var("AUTOLOAD_DUMPR_CACHE_DIR") {
-            if !p.is_empty() {
-                return Ok(Self {
-                    root: PathBuf::from(p),
-                });
+        for var in ["COMPOSR_CACHE_DIR", "AUTOLOAD_DUMPR_CACHE_DIR"] {
+            if let Ok(p) = std::env::var(var) {
+                if !p.is_empty() {
+                    return Ok(Self {
+                        root: PathBuf::from(p),
+                    });
+                }
             }
         }
         let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
@@ -37,9 +47,16 @@ impl DistCache {
                 "could not determine cache directory: HOME and XDG_CACHE_HOME are both unset"
             ));
         };
-        Ok(Self {
-            root: base.join("autoload-dumpr").join("files"),
-        })
+        let new_root = base.join("composr").join("files");
+        let legacy_root = base.join("autoload-dumpr").join("files");
+        if !new_root.exists() && legacy_root.exists() {
+            tracing::info!(
+                "using legacy cache at {} (rename composr -> composer one-time-migrate)",
+                legacy_root.display()
+            );
+            return Ok(Self { root: legacy_root });
+        }
+        Ok(Self { root: new_root })
     }
 
     pub fn root(&self) -> &Path {
