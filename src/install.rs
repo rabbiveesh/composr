@@ -408,7 +408,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     // tbachert/spi) install-time hooks aren't load-bearing; their PHP
     // code in vendor/ works at runtime without composer-side activation.
     let needs_bootstrap = !bootstrap_complete(&vendor_dir);
-    if needs_bootstrap {
+    let (autoload_stats, autoload_mode) = if needs_bootstrap {
         tracing::info!("autoload bootstrap missing — generating natively");
         let dump_opts = DumpOptions {
             root: root.clone(),
@@ -432,15 +432,34 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             suffix: &suffix,
         })
         .context("writing autoload bootstrap")?;
-        tracing::info!(
-            "bootstrap written ({} classes, walk took {}ms)",
-            stats.classes,
-            stats.elapsed_ms
-        );
+        (stats, "bootstrap")
     } else {
-        crate::dump_autoload(&root, opts.dev)
+        let stats = crate::dump_autoload(&root, opts.dev)
             .context("running dump-autoload after install")?;
-    }
+        (stats, "incremental")
+    };
+
+    // One-line user-visible summary, mirroring the install/discover lines.
+    // Headline metrics: total classes, per-package classmap-cache hit rate
+    // (the headline win when warm), per-file mtime-cache hit rate (the
+    // root + uncacheable packages), and wall time.
+    let pkg_total = autoload_stats.package_cache_hits + autoload_stats.package_cache_misses;
+    let pkg_summary = if pkg_total > 0 {
+        format!(
+            "{}/{} pkg cached",
+            autoload_stats.package_cache_hits, pkg_total
+        )
+    } else {
+        "no cacheable pkgs".to_string()
+    };
+    println!(
+        "  Autoload ({}): {} classes ({}, {} files reparsed, {}ms)",
+        autoload_mode,
+        autoload_stats.classes,
+        pkg_summary,
+        autoload_stats.misses,
+        autoload_stats.elapsed_ms
+    );
     if timing {
         eprintln!("STAGE bootstrap: {}ms", t_bootstrap.elapsed().as_millis());
     }
