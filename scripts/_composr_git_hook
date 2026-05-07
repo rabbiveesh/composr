@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
 # Keep `vendor/` and the autoload classmap in sync with the working
-# tree after a git op (checkout / merge / rewrite). Cheap when the lock
-# didn't move, automatic vendor reconcile when it did.
+# tree after a git op (checkout / merge / rewrite).
 #
-# Decision tree:
-#   composer.lock unchanged between <prev_ref>..<new_ref>
-#       → just refresh the classmap (`_autoload_dumpr_run` if available,
-#         else `composr` directly). No vendor mutation, no scripts.
-#   composer.lock changed
-#       → `composr install --no-scripts`. Sync vendor, regenerate the
-#         autoload bootstrap, run native package:discover. `--no-scripts`
-#         keeps every branch switch from re-firing the project's
-#         post-install lifecycle hooks (Laravel migrations, IDE-helper
-#         regens, etc.) — drop the flag once you've audited that those
-#         are safe to fire on every switch.
+# Always runs `composr install --no-scripts`. We used to short-circuit
+# on a ref-to-ref `composer.lock` diff (cheap classmap refresh when
+# unchanged), but that missed the most common real failure mode: lock
+# unchanged across the two refs, but vendor on disk is stale relative
+# to that lock (because vendor was last installed long before). The
+# user noticed it as "manual `composr install` does an install but the
+# hook didn't" — exactly that scenario. `composr install` is
+# idempotent and ~700ms warm-cache when there's nothing to do, so the
+# correctness is worth the 400ms over the old refresh-only path.
+#
+# `--no-scripts` is the conservative default — drop the flag if you've
+# audited that your project's `post-install-cmd` / `post-autoload-dump`
+# are safe to fire on every branch switch.
 #
 # Usage:
-#   _composr_git_hook <label> [prev_ref] [new_ref]
+#   _composr_git_hook <label> [unused] [unused]
 #
-# <label> shows up in the pretty-printer output (e.g. "post-checkout").
-# prev_ref defaults to `HEAD@{1}`, new_ref to `HEAD` — correct for
-# post-merge and post-rewrite. post-checkout hooks should pass the
-# explicit refs that git supplies as $1 and $2 (those are reliable;
-# HEAD@{1} for post-checkout depends on whether the checkout updated
-# the reflog and is sometimes wrong).
+# <label> is shown as a dim-bracketed prefix on the preamble line so
+# the caller can identify itself (e.g. "post-checkout"). The two
+# trailing args are accepted for compat with the previous signature
+# but ignored.
 #
 # Override paths:
 #   $COMPOSR — path to the composr binary (default: `composr` on PATH).
@@ -31,54 +30,25 @@
 set -u
 
 label="${1:?label required}"
-# Bash's `${var:-default}` parser is unreliable when the default
-# contains `{` `}` (HEAD@{1} would close the outer expansion early).
-# Explicit fallbacks instead.
-prev_ref="${2:-}"
-[ -z "$prev_ref" ] && prev_ref='HEAD@{1}'
-new_ref="${3:-}"
-[ -z "$new_ref" ] && new_ref='HEAD'
 
 composr="${COMPOSR:-composr}"
 if ! command -v "$composr" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Must be in a git repo for the diff check; bail silently if not.
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    exit 0
-fi
+# Must be in a git repo + have a composer.json at PWD; bail silently
+# otherwise (e.g. hook fires from a non-PHP sibling repo).
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+[ -f composer.json ] || exit 0
 
-# Must have a composer.json at PWD — if a hook fires from a non-PHP
-# repo (sibling project sharing these scripts via $PATH), this is a
-# clean no-op.
-if [ ! -f composer.json ]; then
-    exit 0
-fi
-
-# `2>/dev/null` swallows "unknown revision" if HEAD@{1} doesn't exist
-# (e.g. fresh clone, first checkout). git diff --quiet returns 0 when
-# the path is unchanged, 1 when it differs, 128 on error. Treat error
-# as "unchanged" — we'd rather skip a vendor sync than spuriously run
-# install on a hook that can't resolve its own refs.
-if git diff --quiet "$prev_ref" "$new_ref" -- composer.lock 2>/dev/null; then
-    # Lock unchanged — cheap classmap refresh.
-    if command -v _autoload_dumpr_run >/dev/null 2>&1; then
-        _autoload_dumpr_run "$label"
-    else
-        "$composr" --root "$PWD" >/dev/null 2>&1 || true
-    fi
-    exit 0
-fi
-
-# Lock moved — full reconcile. composr install prints its own one-line
-# status, so no pretty-printer wrapper here.
+# Pretty preamble so the user knows the lag is intentional. composr
+# install prints its own one-line summary when it finishes.
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
     DIM=$'\033[2m'; CYAN_B=$'\033[1;36m'; RESET=$'\033[0m'
 else
     DIM=""; CYAN_B=""; RESET=""
 fi
-printf '%s[%s]%s  %scomposr install%s %s(lock moved, syncing vendor)%s\n' \
+printf '%s[%s]%s  %scomposr install%s %s(syncing vendor)%s\n' \
     "$DIM" "$label" "$RESET" \
     "$CYAN_B" "$RESET" \
     "$DIM" "$RESET" >&2
