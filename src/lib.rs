@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod cache;
 pub mod classmap_cache;
 pub mod composer_shim;
+pub mod composr_config;
 pub mod config;
 pub mod diff;
 pub mod discover;

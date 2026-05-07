@@ -20,7 +20,8 @@
 use crate::auth::AuthConfig;
 use crate::binsetup;
 use crate::bootstrap::{write_bootstrap, BootstrapInput};
-use crate::composer_shim::{bootstrap_complete, entries_need_composer, Composer};
+use crate::composer_shim::{bootstrap_complete, entries_need_composer, Composer, INERT_ALLOWLIST};
+use crate::composr_config::ComposrConfig;
 use crate::diff::{compute_ops, Op};
 use crate::dist_cache::DistCache;
 use crate::download::{DownloadOutcome, Downloader};
@@ -130,8 +131,11 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         }
     }
 
-    // Plugin policy. Even with the relaxed default, surface the plugin names
-    // up front so the user knows which packages are inert.
+    // Plugin policy. Strict mode bails on any composer-plugin in the lock,
+    // regardless of allowlists. In the default (relaxed) mode, surface the
+    // plugin names up front — but skip plugins on the hardcoded
+    // INERT_ALLOWLIST or the project-local allowlist (composr.json), since
+    // those are known-safe to install as inert files.
     let plugins: Vec<&LockedPackage> = lock
         .packages
         .iter()
@@ -145,10 +149,21 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
                 names.join(", ")
             );
         }
-        tracing::warn!(
-            "installing composer-plugin packages as inert files (their composer-side hooks won't run): {}",
-            names.join(", ")
-        );
+        let composr_cfg = ComposrConfig::load(&root);
+        let unknown: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| {
+                !INERT_ALLOWLIST.contains(n)
+                    && !composr_cfg.allow_inert_plugins.iter().any(|a| a == n)
+            })
+            .collect();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "installing composer-plugin packages as inert files (their composer-side hooks won't run): {}",
+                unknown.join(", ")
+            );
+        }
     }
 
     let installed = InstalledJson::read(&installed_json_path)?;

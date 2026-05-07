@@ -157,25 +157,29 @@ pub fn bootstrap_complete(vendor_dir: &Path) -> bool {
     required.iter().all(|p| p.exists())
 }
 
+/// Composer-plugin packages whose activation only registers event
+/// subscribers / runtime strategy lookups — installing their files is
+/// enough; activation is safely a no-op for our purposes. Anything NOT on
+/// this list is treated conservatively (warned about at install time, or
+/// triggers composer delegation if activation matters). Project-local
+/// extensions live in `composr.json` → `allow-inert-plugins`.
+pub const INERT_ALLOWLIST: &[&str] = &[
+    "pestphp/pest-plugin",
+    "pestphp/pest-plugin-laravel",
+    "pestphp/pest-plugin-mock",
+    "pestphp/pest-plugin-arch",
+    "pestphp/pest-plugin-type-coverage",
+    // tbachert/spi: registers SPI providers at runtime, no install-time
+    // file writes
+    "tbachert/spi",
+    "phpstan/extension-installer",
+];
+
 /// Returns true if any package in the lock declares a `composer-plugin` type
 /// AND the plugin is one whose activation writes install-time state we can't
 /// trivially reproduce. Conservative list — anything not on the explicit
 /// "inert at install time" allowlist counts.
 pub fn lock_needs_plugin_activation(lock: &crate::lock::Lock) -> bool {
-    // Plugins whose activation only registers event subscribers / runtime
-    // strategy lookups — installing their files is enough; activation is
-    // safely a no-op for our purposes.
-    const INERT_ALLOWLIST: &[&str] = &[
-        "pestphp/pest-plugin",
-        "pestphp/pest-plugin-laravel",
-        "pestphp/pest-plugin-mock",
-        "pestphp/pest-plugin-arch",
-        "pestphp/pest-plugin-type-coverage",
-        // tbachert/spi: registers SPI providers at runtime, no install-time
-        // file writes
-        "tbachert/spi",
-        "phpstan/extension-installer",
-    ];
     lock.packages
         .iter()
         .filter(|p| p.package_type == "composer-plugin")

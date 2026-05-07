@@ -223,8 +223,17 @@ Override binary paths via `$AUTOLOAD_DUMPR` (the dumper) and
   activation hooks don't run. For the plugins we observe in our codebase
   (`php-http/discovery`, `pestphp/pest-plugin`, `tbachert/spi`,
   `phpstan/extension-installer`) the runtime parts continue to function;
-  install-time hooks aren't load-bearing. `--strict-plugins` lets you
-  refuse instead.
+  install-time hooks aren't load-bearing. composr ships a built-in
+  allowlist of known-inert plugins and stays quiet about those; for
+  project-specific additions, drop a `composr.json` next to your
+  `composer.json`:
+
+  ```json
+  { "allow-inert-plugins": ["vendor/some-plugin"] }
+  ```
+
+  `--strict-plugins` ignores the allowlist and refuses any plugin in the
+  lock.
 - **Platform-check stub.** `vendor/composer/platform_check.php` is
   emitted as a no-op. A correct implementation would emit php-version
   + ext-* checks from the lock's platform reqs.
