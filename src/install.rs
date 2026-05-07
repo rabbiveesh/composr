@@ -33,6 +33,7 @@ use crate::installed::{
 use crate::lock::{Lock, LockedPackage};
 use crate::scripts::{Lifecycle, Runner, ScriptOutcome};
 use anyhow::{anyhow, bail, Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -273,6 +274,24 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     // installation are idempotent on shared dirs (mkdir -p style), so this
     // loop is safe to run in parallel. With a warm dist cache the work is
     // CPU+IO bound on zip decompression; rayon scales it across cores.
+    //
+    // Progress bar mirrors the download bar's style/template so the
+    // visual signal is consistent across the install pipeline.
+    // `ProgressBar` is `Send + Sync` (Arc-backed), so the rayon closure
+    // can call `inc` / `set_message` on it without extra wrapping.
+    let extract_pb = if !zip_installs.is_empty() {
+        let pb = ProgressBar::new(zip_installs.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  {bar:40.cyan/blue} {pos:>4}/{len:4} {msg}",
+            )
+            .unwrap(),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
     let t_extract = Instant::now();
     zip_installs
         .par_iter()
@@ -290,8 +309,15 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
                 &bin_dir,
                 &vendor_dir,
             )?;
+            if let Some(pb) = &extract_pb {
+                pb.inc(1);
+                pb.set_message(format!("extracted {}", pkg.name));
+            }
             Ok(())
         })?;
+    if let Some(pb) = extract_pb {
+        pb.finish_and_clear();
+    }
     if timing {
         eprintln!(
             "STAGE extract ({} zips): {}ms",
