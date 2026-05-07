@@ -173,6 +173,48 @@ emission, autoload bootstrap files, lock parsing, install diff, dist
 extraction (zip + path-symlinks), script entry classification, and the
 discover algorithm + var_export output shape.
 
+## Optional helper scripts (`scripts/`)
+
+A handful of repo-agnostic shell helpers live in `scripts/`. Drop the
+directory on `$PATH` (or symlink the individual files into `~/bin`)
+and any composer-based project can use them.
+
+- **`_autoload_dumpr_run <label> [args...]`** — runs `composr
+  dump-autoload --emit-stats`, pipes the JSON stats through the
+  pretty-printer for a single colored summary line. The label shows up
+  in dim brackets at the start of the line so a git-hook caller can
+  identify itself.
+- **`_autoload_dumpr_pretty <label>`** — the formatter. Reads JSON
+  stats on stdin, writes one colored summary line to stderr.
+- **`composer-dump-fast`** — drop-in for `composer dump-autoload -o`:
+  runs the native classmap dumper, then asks composer to fire
+  pre/post-autoload-dump scripts (so Laravel's `package:discover` and
+  friends still run).
+- **`_composr_git_hook <label> [prev_ref] [new_ref]`** — git-hook
+  helper. If `composer.lock` differs between `prev_ref..new_ref`, runs
+  `composr install --no-scripts` to sync vendor; otherwise just
+  refreshes the classmap. `prev_ref` defaults to `HEAD@{1}`, `new_ref`
+  to `HEAD` — correct for `post-merge` and `post-rewrite`.
+  `post-checkout` should pass git's `$1` and `$2` explicitly.
+
+Example `post-checkout` hook:
+
+```sh
+#!/usr/bin/env bash
+[ "$3" = "1" ] || exit 0
+command -v _composr_git_hook >/dev/null 2>&1 || exit 0
+_composr_git_hook post-checkout "$1" "$2"
+```
+
+This makes branch switches automatically reconcile vendor when the
+lock moved (so you don't get "class not found" on packages added in
+the new branch), while staying free when it didn't. `--no-scripts` is
+the default; remove it from the helper once you've audited that your
+project's `post-install-cmd` is safe to fire on every branch switch.
+
+Override binary paths via `$AUTOLOAD_DUMPR` (the dumper) and
+`$COMPOSR` (the install runner). `$NO_COLOR` is honored everywhere.
+
 ## Limitations & out-of-scope
 
 - **No `composer update`.** composr is lock-driven; you still need

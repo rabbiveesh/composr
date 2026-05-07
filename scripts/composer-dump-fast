@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Drop-in replacement for `composer dump-autoload -o`.
+#
+# Runs the Rust classmap dumper on the host (fast) and then asks composer to
+# fire the pre/post-autoload-dump scripts the way the real `dump-autoload`
+# would — Laravel's `package:discover`, bootstrap-cache flushes, IDE-helper
+# regen, etc. depend on those hooks running.
+#
+# Usage:
+#   composer-dump-fast [--no-dev] [--strict] [--verbose]
+#
+# Required on PATH:
+#   autoload-dumpr   (or set $AUTOLOAD_DUMPR to its absolute path)
+#   composer         (your existing shim — dockerized is fine)
+#
+# Notes:
+#   * Run from the project root (the dir containing composer.json), the same
+#     way you'd run `composer dump-autoload`.
+#   * If composer is a docker-compose shim, the `app` service must be up so
+#     that `composer run-script post-autoload-dump` can actually fire the
+#     PHP-side hooks. The classmap dump itself runs on the host and does not
+#     need the container.
+
+set -euo pipefail
+
+bin="${AUTOLOAD_DUMPR:-autoload-dumpr}"
+
+if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "composer-dump-fast: '$bin' not found on PATH (set \$AUTOLOAD_DUMPR to override)" >&2
+    exit 127
+fi
+if ! command -v composer >/dev/null 2>&1; then
+    echo "composer-dump-fast: 'composer' not on PATH" >&2
+    exit 127
+fi
+if [[ ! -f composer.json ]]; then
+    echo "composer-dump-fast: no composer.json in $PWD — run from your project root" >&2
+    exit 1
+fi
+
+# pre-autoload-dump is uncommon but composer fires it if defined. Swallow
+# "script not found" — `|| true` keeps the script going when the project
+# doesn't declare one.
+composer run-script pre-autoload-dump --no-interaction 2>/dev/null || true
+
+# The actual classmap rewrite. `set -e` aborts the script (and skips the
+# post-hook) if the dump fails — running package:discover against a broken
+# classmap would just produce a noisier failure.
+#
+# Use the shared runner when it's available (handles "starting…" preamble +
+# pretty result formatting); fall back to raw JSON if the helper is missing.
+if command -v _autoload_dumpr_run >/dev/null 2>&1; then
+    AUTOLOAD_DUMPR="$bin" _autoload_dumpr_run composer-dump-fast \
+        --root "$PWD" "$@"
+else
+    "$bin" --root "$PWD" --emit-stats "$@"
+fi
+
+# Laravel's post-autoload-dump hook lives here: package:discover, clearing
+# bootstrap/cache, etc. This is the call that *needs* the container running
+# if composer is a docker shim.
+composer run-script post-autoload-dump --no-interaction

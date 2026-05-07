@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Keep `vendor/` and the autoload classmap in sync with the working
+# tree after a git op (checkout / merge / rewrite). Cheap when the lock
+# didn't move, automatic vendor reconcile when it did.
+#
+# Decision tree:
+#   composer.lock unchanged between <prev_ref>..<new_ref>
+#       → just refresh the classmap (`_autoload_dumpr_run` if available,
+#         else `composr` directly). No vendor mutation, no scripts.
+#   composer.lock changed
+#       → `composr install --no-scripts`. Sync vendor, regenerate the
+#         autoload bootstrap, run native package:discover. `--no-scripts`
+#         keeps every branch switch from re-firing the project's
+#         post-install lifecycle hooks (Laravel migrations, IDE-helper
+#         regens, etc.) — drop the flag once you've audited that those
+#         are safe to fire on every switch.
+#
+# Usage:
+#   _composr_git_hook <label> [prev_ref] [new_ref]
+#
+# <label> shows up in the pretty-printer output (e.g. "post-checkout").
+# prev_ref defaults to `HEAD@{1}`, new_ref to `HEAD` — correct for
+# post-merge and post-rewrite. post-checkout hooks should pass the
+# explicit refs that git supplies as $1 and $2 (those are reliable;
+# HEAD@{1} for post-checkout depends on whether the checkout updated
+# the reflog and is sometimes wrong).
+#
+# Override paths:
+#   $COMPOSR — path to the composr binary (default: `composr` on PATH).
+
+set -u
+
+label="${1:?label required}"
+# Bash's `${var:-default}` parser is unreliable when the default
+# contains `{` `}` (HEAD@{1} would close the outer expansion early).
+# Explicit fallbacks instead.
+prev_ref="${2:-}"
+[ -z "$prev_ref" ] && prev_ref='HEAD@{1}'
+new_ref="${3:-}"
+[ -z "$new_ref" ] && new_ref='HEAD'
+
+composr="${COMPOSR:-composr}"
+if ! command -v "$composr" >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Must be in a git repo for the diff check; bail silently if not.
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Must have a composer.json at PWD — if a hook fires from a non-PHP
+# repo (sibling project sharing these scripts via $PATH), this is a
+# clean no-op.
+if [ ! -f composer.json ]; then
+    exit 0
+fi
+
+# `2>/dev/null` swallows "unknown revision" if HEAD@{1} doesn't exist
+# (e.g. fresh clone, first checkout). git diff --quiet returns 0 when
+# the path is unchanged, 1 when it differs, 128 on error. Treat error
+# as "unchanged" — we'd rather skip a vendor sync than spuriously run
+# install on a hook that can't resolve its own refs.
+if git diff --quiet "$prev_ref" "$new_ref" -- composer.lock 2>/dev/null; then
+    # Lock unchanged — cheap classmap refresh.
+    if command -v _autoload_dumpr_run >/dev/null 2>&1; then
+        _autoload_dumpr_run "$label"
+    else
+        "$composr" --root "$PWD" >/dev/null 2>&1 || true
+    fi
+    exit 0
+fi
+
+# Lock moved — full reconcile. composr install prints its own one-line
+# status, so no pretty-printer wrapper here.
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    DIM=$'\033[2m'; CYAN_B=$'\033[1;36m'; RESET=$'\033[0m'
+else
+    DIM=""; CYAN_B=""; RESET=""
+fi
+printf '%s[%s]%s  %scomposr install%s %s(lock moved, syncing vendor)%s\n' \
+    "$DIM" "$label" "$RESET" \
+    "$CYAN_B" "$RESET" \
+    "$DIM" "$RESET" >&2
+
+"$composr" install --root "$PWD" --no-scripts || true
