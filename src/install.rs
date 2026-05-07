@@ -33,6 +33,7 @@ use crate::installed::{
 use crate::lock::{Lock, LockedPackage};
 use crate::scripts::{Lifecycle, Runner, ScriptOutcome};
 use anyhow::{anyhow, bail, Context, Result};
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -267,23 +268,30 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         }
     }
 
-    // Zip installs.
+    // Zip installs. Each package extracts to its own `install_path` and
+    // writes proxies to a shared `vendor/bin/` — both extract and bin
+    // installation are idempotent on shared dirs (mkdir -p style), so this
+    // loop is safe to run in parallel. With a warm dist cache the work is
+    // CPU+IO bound on zip decompression; rayon scales it across cores.
     let t_extract = Instant::now();
-    for pkg in &zip_installs {
-        let outcome = cache_path_by_name.get(&pkg.name).ok_or_else(|| {
-            anyhow!("internal: no download outcome for {}", pkg.name)
+    zip_installs
+        .par_iter()
+        .try_for_each(|pkg| -> Result<()> {
+            let outcome = cache_path_by_name
+                .get(&pkg.name)
+                .ok_or_else(|| anyhow!("internal: no download outcome for {}", pkg.name))?;
+            let install_path = vendor_dir.join(&pkg.name);
+            extract_zip_to_install_path(&outcome.cached_path, &install_path, &vendor_dir)
+                .with_context(|| format!("extracting {}", pkg.name))?;
+            binsetup::install_package_bins(
+                &pkg.name,
+                &install_path,
+                &pkg.bin,
+                &bin_dir,
+                &vendor_dir,
+            )?;
+            Ok(())
         })?;
-        let install_path = vendor_dir.join(&pkg.name);
-        extract_zip_to_install_path(&outcome.cached_path, &install_path, &vendor_dir)
-            .with_context(|| format!("extracting {}", pkg.name))?;
-        binsetup::install_package_bins(
-            &pkg.name,
-            &install_path,
-            &pkg.bin,
-            &bin_dir,
-            &vendor_dir,
-        )?;
-    }
     if timing {
         eprintln!(
             "STAGE extract ({} zips): {}ms",

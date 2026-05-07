@@ -16,7 +16,7 @@ Latest measured cold-install on monolith-app (292 packages, dist cache warm):
 
 |                          | composer | composr |
 |--------------------------|---------:|--------:|
-| Cold install end-to-end  |    ~72s  |   ~34s  |
+| Cold install end-to-end  |    ~72s  | ~25–30s |
 | `package:discover` step  |    ~30s  |    ~5ms |
 | Composer subprocess calls|       —  |       0 |
 
@@ -28,14 +28,17 @@ print these to stderr yourself):
 
 ```
 STAGE download: 2ms        # cache hits, no real I/O
-STAGE extract (289 zips): ~33s  # serial zip extraction — current bottleneck
-STAGE metadata: 12ms       # installed.json + installed.php
-STAGE bootstrap: ~11s      # parallel classmap walk + emit autoload files
-STAGE scripts: 28ms        # native discover + rm -f, no composer call
+STAGE extract (289 zips): ~14s  # zip extraction, parallel via rayon
+STAGE metadata: 9ms        # installed.json + installed.php
+STAGE bootstrap: ~12s      # parallel classmap walk + emit autoload files
+STAGE scripts: 30ms        # native discover + rm -f, no composer call
 ```
 
-So the remaining time is ~75% zip extraction (currently a serial loop —
-parallelizing it is the next obvious lever) and ~25% classmap walk.
+Remaining wall-clock is split roughly half-and-half between extract and
+classmap walk. CPU usage during extract on an M-series Mac sits around
+~2.5 cores — the per-archive `zip` decompression is single-threaded, so
+extracting many in parallel only scales until disk metadata throughput
+or the largest single archive becomes the limit.
 
 ## Subcommands
 
