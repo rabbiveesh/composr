@@ -10,6 +10,7 @@ use std::time::Instant;
 #[command(
     name = "composr",
     about = "Fast Rust install + dump-autoload for Composer projects (vowels not included)",
+    version,
     arg_required_else_help = false
 )]
 struct Cli {
