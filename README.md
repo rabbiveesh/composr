@@ -1,0 +1,154 @@
+# composr
+
+A Rust replacement for the slow parts of Composer-based PHP installs (vowels
+not included). Targets the cold-start install path — the bit where `composer
+install` chews through dist downloads, autoload bootstrap, and Laravel's
+`package:discover` for half a minute or more.
+
+## Status
+
+Working end-to-end on real apps. Two production-shape Laravel codebases
+(`service-app` and `monolith-app`) install cleanly with composr in
+place of `composer install`, with output (vendor tree, autoload bootstrap,
+packages.php) that's byte-equivalent to composer's own.
+
+Latest measured cold-install on monolith-app (292 packages, dist cache warm):
+
+|                          | composer | composr |
+|--------------------------|---------:|--------:|
+| Cold install end-to-end  |    ~72s  |   ~34s  |
+| `package:discover` step  |    ~30s  |    ~5ms |
+| Composer subprocess calls|       —  |       0 |
+
+Zero composer subprocess calls means the post-autoload-dump event is being
+fully handled natively (see "Hybrid mode" below).
+
+## Subcommands
+
+```
+composr install            # lock-driven install: download → extract → autoload bootstrap → scripts
+composr dump-autoload      # rewrite vendor/composer/autoload_classmap.php (and patch autoload_static.php)
+composr discover           # rewrite bootstrap/cache/packages.php (Laravel's package:discover)
+composr                    # alias for `dump-autoload` (back-compat with the original tool name)
+```
+
+`composr install` is the one-stop shop. The others are mostly useful for
+debugging or for users who only want one piece.
+
+### What `composr install` does
+
+1. Reads `composer.lock`; checks the content-hash against `composer.json`
+   (advisory).
+2. Reads `vendor/composer/installed.json`, computes diff: install / remove
+   ops.
+3. Concurrent HTTP fetch of every dist archive we don't already have
+   cached. Cache lives at `$XDG_CACHE_HOME/composr/files` (override with
+   `COMPOSR_CACHE_DIR` or `--cache-dir`).
+4. Removes (rm -rf old install paths + their bin proxies).
+5. Extracts each zip to its install path; sets up vendor/bin proxies.
+   `dist.type == "path"` packages get symlinked from sibling repos.
+6. Writes `vendor/composer/installed.json`, `installed.php`, and
+   `InstalledVersions.php` (the latter bundled MIT from composer/composer).
+7. Generates the autoload bootstrap natively when missing
+   (`autoload.php`, `ClassLoader.php`, `autoload_real.php`,
+   `autoload_static.php`, the four data files, `platform_check.php`,
+   `LICENSE`). When the bootstrap is already in place, takes the fast
+   path and just patches the classmap.
+8. Runs script lifecycle events (`pre-install-cmd`, `post-autoload-dump`,
+   `post-install-cmd`) — see "Hybrid mode" for how class-method handlers
+   are dispatched.
+
+### What `composr discover` does
+
+Native port of `Illuminate\Foundation\PackageManifest::build`. Reads
+`vendor/composer/installed.json` and the root `composer.json`'s
+`extra.laravel.dont-discover`, accumulates transitive opt-outs, drops
+empty configs, and writes `bootstrap/cache/packages.php` byte-compatible
+with PHP's `var_export`. Used internally by `composr install`'s
+post-autoload-dump path; also runnable standalone.
+
+```
+composr discover --root <project> [--vendor-dir <p>] [--manifest-path <p>]
+```
+
+`--vendor-dir` is for layouts where the Laravel base path lives inside a
+larger composer project (e.g. monolith-app's `laravel-app/` with a
+sibling `vendor/`).
+
+## Hybrid mode
+
+Composer's `EventDispatcher` is the only correct way to invoke
+class-method script handlers (`Foo\Bar::baz`-shaped entries in
+`composer.json` scripts). composr does not reimplement it. Instead, when
+a script event contains a class-method handler, composr shells out to
+a real `composer run-script <event>` for that one event.
+
+Two narrowing exceptions reduce the delegation surface for Laravel apps:
+
+- **`Illuminate\Foundation\ComposerScripts::postAutoloadDump`** is
+  recognized as the known clearCompiled handler and skipped natively.
+  Its only effect is unlinking cached `services.php` and `packages.php`
+  — both are regenerated immediately afterward (by the typical
+  `rm -f bootstrap/cache/*.php` line that follows it, and by composr's
+  native discover).
+- **`@php <artisan> package:discover [args]`** is replaced with native
+  `composr discover` (basePath derived from the artisan path, vendor
+  dir = the install pipeline's `<root>/vendor`).
+
+If both exceptions fire and every other entry in the event is a plain
+shell/php script, the entire `post-autoload-dump` runs without a
+composer subprocess. That's how monolith-app gets to "0 composer calls"
+on a cold install.
+
+Composer binary resolution order: `--composer-bin <path>`,
+`COMPOSR_COMPOSER` env, `composer` on `PATH`. If nothing's found and
+delegation is needed, composr warns and continues with class-method
+handlers skipped.
+
+## Flags worth knowing
+
+`composr install`:
+- `--no-dev` — match `composer install --no-dev`
+- `--no-scripts` — skip every script lifecycle event
+- `--no-discover` — opt out of the `package:discover` interception
+- `--no-composer` — never shell out, even for class-method handlers
+  (those will be skipped with a warning)
+- `--strict-plugins` — abort if any `composer-plugin` is in the lock
+  (default behavior is to install plugins as inert files and warn)
+- `--concurrency <n>` — parallel HTTP downloads (default ~CPU count, capped at 12)
+- `--dry-run` — print the install/remove operations and exit
+
+## Tests
+
+```
+cargo test
+```
+
+68 unit tests at the time of writing, covering: PHP parsing edge cases
+(non-UTF-8 class names, anonymous classes, nested namespaces), classmap
+emission, autoload bootstrap files, lock parsing, install diff, dist
+extraction (zip + path-symlinks), script entry classification, and the
+discover algorithm + var_export output shape.
+
+## Limitations & out-of-scope
+
+- **No `composer update`.** composr is lock-driven; you still need
+  composer to refresh the lock against `composer.json`.
+- **Composer plugins install as inert files.** Their composer-side
+  activation hooks don't run. For the plugins we observe in our codebase
+  (`php-http/discovery`, `pestphp/pest-plugin`, `tbachert/spi`,
+  `phpstan/extension-installer`) the runtime parts continue to function;
+  install-time hooks aren't load-bearing. `--strict-plugins` lets you
+  refuse instead.
+- **Platform-check stub.** `vendor/composer/platform_check.php` is
+  emitted as a no-op. A correct implementation would emit php-version
+  + ext-* checks from the lock's platform reqs.
+- **`route:cache`, `view:cache`, `optimize`** etc. — Laravel's other
+  cacheable artisan commands aren't intercepted yet. Same shape as
+  `package:discover`; doable in a follow-up.
+- **Plugin-driven service-provider discovery** (rare, e.g. some packages
+  register providers via composer plugin code rather than
+  `extra.laravel`). composr matches Laravel here: not handled. Those
+  projects rely on plugin activation, which runs only via
+  `composer install` — install via composer once, then composr from
+  there.
