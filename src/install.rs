@@ -27,7 +27,8 @@ use crate::dist_cache::DistCache;
 use crate::download::{DownloadOutcome, Downloader};
 use crate::extract::{extract_zip_to_install_path, install_path_package};
 use crate::installed::{
-    build_installed_json, render_installed_php, write_installed_json, InstalledJson,
+    build_installed_json, render_installed_php, write_installed_json,
+    write_installed_versions_php, InstalledJson,
 };
 use crate::lock::{Lock, LockedPackage};
 use crate::scripts::{Lifecycle, Runner};
@@ -305,6 +306,11 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     // Persist installed metadata.
     let installed_payload = build_installed_json(&lock, opts.dev);
     write_installed_json(&installed_json_path, &installed_payload)?;
+    // Composer's runtime InstalledVersions class — copied from composer's
+    // own source. Composer normally writes this during `install` (not
+    // dump-autoload), so even our delegate-to-composer path doesn't seed
+    // it. Always written by us.
+    write_installed_versions_php(&composer_dir.join("InstalledVersions.php"))?;
 
     let root_version_pretty = root_json
         .get("version")

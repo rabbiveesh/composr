@@ -127,6 +127,29 @@ pub fn write_installed_json(path: &Path, payload: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Composer's `FilesystemRepository::write()` copies `InstalledVersions.php`
+/// into `vendor/composer/` as part of writing `installed.json`. The class
+/// itself is static (its content doesn't depend on the project — it's just
+/// composer's runtime API for `Composer\InstalledVersions::getRootPackage()`
+/// and friends). composer's `dump-autoload` does NOT recreate it when
+/// missing — only `composer install` does.
+///
+/// We bundle the canonical file as a build-time asset and write it ourselves
+/// alongside `installed.json`. The bundled copy comes from
+/// composer/composer source under MIT.
+pub fn write_installed_versions_php(path: &Path) -> Result<()> {
+    const SOURCE: &[u8] = include_bytes!("../assets/InstalledVersions.php");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let tmp = path.with_extension("php.tmp");
+    std::fs::write(&tmp, SOURCE)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
 /// Render `installed.php` — a PHP file that returns a nested array. Consumed
 /// by `Composer\InstalledVersions` at runtime (Laravel's package:discover
 /// reads it via that class).
