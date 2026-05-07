@@ -3,7 +3,8 @@
 //! packages.
 
 use crate::cache::{hash_composer_lock, Cache, CacheEntry};
-use crate::config::ResolvedConfig;
+use crate::classmap_cache::{ClassmapCache, PackageClassmap};
+use crate::config::{PackageAutoload, ResolvedConfig};
 use crate::emit::{
     render_classmap_php, render_static_classmap_body, replace_static_classmap, ClassMap,
 };
@@ -35,12 +36,30 @@ pub struct DumpStats {
     pub errors: usize,
     pub classes: usize,
     pub elapsed_ms: u128,
+    /// Number of vendor packages whose contribution was loaded from the
+    /// per-package classmap cache (no walk, no parse).
+    pub package_cache_hits: usize,
+    /// Number of vendor packages we walked and parsed because their
+    /// per-package cache file was absent (and then wrote afterward).
+    pub package_cache_misses: usize,
 }
 
 /// Compute the classmap without writing anything. Returned alongside the
 /// ResolvedConfig + DumpStats so callers (the bootstrap path in install.rs,
 /// in particular) can write a different shape of output without redoing the
 /// expensive walk + parse work.
+///
+/// Two layers of caching:
+///
+/// 1. **Per-package classmap cache** (`classmap_cache.rs`) — keyed by
+///    `(package_name, dist.reference)`, stored under
+///    `$XDG_CACHE_HOME/composr/classmap/`. Survives `rm -rf vendor`. On
+///    a hit we skip walk + parse + admission for that package and merge
+///    the cached entries straight into the map.
+/// 2. **Per-file mtime cache** (`cache.rs`) — keyed by file path with
+///    `(mtime_ns, size)` fingerprint. Used for everything we still have
+///    to walk: the project root, path-installs, and packages whose
+///    per-package cache was missing. Lives inside `vendor/composer/`.
 pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, DumpStats)> {
     let started = Instant::now();
     let root = opts.root.clone();
@@ -54,15 +73,60 @@ pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, D
     let cfg = ResolvedConfig::load(&root, opts.with_dev)?;
     tracing::info!(packages = cfg.packages.len(), "config loaded");
 
-    let walked: Vec<PhpFile> = cfg
-        .packages
+    let map = Mutex::new(ClassMap::new());
+
+    // Tier 1: per-package shared cache. Try to satisfy as many packages
+    // as possible from `~/.cache/composr/classmap/`. Each hit means we
+    // skip the walk + parse for that package entirely.
+    let pkg_cache = if opts.no_cache {
+        None
+    } else {
+        ClassmapCache::discover(None)
+    };
+    let pkg_hits = AtomicUsize::new(0);
+    let pkg_misses = AtomicUsize::new(0);
+
+    // Partition packages: cache-hit (just merge), cache-miss-or-uncacheable
+    // (walk + parse). The root is always uncacheable; vendor packages
+    // need both a cache and a reference to be cacheable.
+    let mut to_walk: Vec<&PackageAutoload> = Vec::with_capacity(cfg.packages.len());
+    // Track which packages we walked + need to write back to the cache.
+    // Stored as &PackageAutoload so we can fetch their reference at save time.
+    let mut walked_packages_to_cache: Vec<&PackageAutoload> = Vec::new();
+
+    for pkg in &cfg.packages {
+        let cacheable = pkg_cache.is_some() && pkg.reference.is_some();
+        if cacheable {
+            let cache = pkg_cache.as_ref().unwrap();
+            let reference = pkg.reference.as_deref().unwrap();
+            if let Some(entry) = cache.load(&pkg.name, reference) {
+                merge_cached_into_map(&entry, &pkg.root, &map);
+                pkg_hits.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // Cache file absent or unreadable — walk this package and
+            // remember to cache the result afterward.
+            pkg_misses.fetch_add(1, Ordering::Relaxed);
+            walked_packages_to_cache.push(pkg);
+        }
+        to_walk.push(pkg);
+    }
+
+    // Tier 2: per-file mtime cache (existing behavior) for the
+    // packages we still have to walk.
+    let walked: Vec<PhpFile> = to_walk
         .par_iter()
         .map(|pkg| collect_files(pkg).unwrap_or_default())
         .reduce(Vec::new, |mut a, b| {
             a.extend(b);
             a
         });
-    tracing::info!(files = walked.len(), "walk complete");
+    tracing::info!(
+        files = walked.len(),
+        pkg_hits = pkg_hits.load(Ordering::Relaxed),
+        pkg_misses = pkg_misses.load(Ordering::Relaxed),
+        "walk complete"
+    );
 
     let lock_hash = hash_composer_lock(&root);
     let mut cache = if opts.no_cache {
@@ -75,9 +139,20 @@ pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, D
     let misses = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let new_entries: Mutex<Vec<(PathBuf, CacheEntry)>> = Mutex::new(Vec::new());
-    let map = Mutex::new(ClassMap::new());
 
     let snapshot = std::mem::take(&mut cache.entries);
+
+    // Per-package admission collector — for each package we walk, we
+    // also collect its post-admission entries so we can persist them
+    // to the per-package cache afterward. Keyed by &str of the package
+    // root path; we'll resolve back to PackageAutoload at save time.
+    let pkg_root_to_name: std::collections::HashMap<PathBuf, &str> = walked_packages_to_cache
+        .iter()
+        .map(|p| (p.root.clone(), p.name.as_str()))
+        .collect();
+    let per_pkg_entries: Mutex<
+        std::collections::HashMap<String, Vec<(Vec<u8>, String)>>,
+    > = Mutex::new(std::collections::HashMap::new());
 
     walked.par_iter().for_each_init(PhpParser::new, |parser, pf| {
         let decls_owned: Vec<Declaration>;
@@ -109,12 +184,54 @@ pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, D
         if decls.is_empty() {
             return;
         }
+
+        // Determine whether this file belongs to a package whose
+        // per-package cache we'll be writing.
+        let owning_pkg_name: Option<(&str, &Path)> =
+            pkg_root_to_name.iter().find_map(|(pkg_root, name)| {
+                if pf.path.starts_with(pkg_root) {
+                    Some((*name, pkg_root.as_path()))
+                } else {
+                    None
+                }
+            });
+
         let mut m = map.lock().unwrap();
+        let mut staged_for_pkg_cache: Vec<(Vec<u8>, String)> = Vec::new();
         for d in decls {
             if !admit(d, &pf.path, &pf.source) {
                 continue;
             }
-            m.entry(d.fqcn.clone()).or_insert_with(|| pf.path.clone());
+            let inserted = match m.entry(d.fqcn.clone()) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(pf.path.clone());
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            };
+            // We cache this admission outcome for the package even if
+            // another package already claimed the FQCN — the cache
+            // captures "what this package contributes," and the global
+            // first-wins merge happens at hit time too.
+            if let Some((_, pkg_root)) = owning_pkg_name {
+                if let Ok(rel) = pf.path.strip_prefix(pkg_root) {
+                    if let Some(rel_str) = rel.to_str() {
+                        let _ = inserted;
+                        staged_for_pkg_cache.push((d.fqcn.clone(), rel_str.to_string()));
+                    }
+                }
+            }
+        }
+        drop(m);
+
+        if let Some((name, _)) = owning_pkg_name {
+            if !staged_for_pkg_cache.is_empty() {
+                let mut by_pkg = per_pkg_entries.lock().unwrap();
+                by_pkg
+                    .entry(name.to_string())
+                    .or_default()
+                    .extend(staged_for_pkg_cache);
+            }
         }
     });
 
@@ -144,6 +261,29 @@ pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, D
         cache.save(&cache_path).ok();
     }
 
+    // Persist per-package caches for the misses we just walked. Errors
+    // are best-effort — log and continue, never fail the install.
+    if let Some(pkg_cache_ref) = pkg_cache.as_ref() {
+        let by_pkg = per_pkg_entries.into_inner().unwrap();
+        for pkg in &walked_packages_to_cache {
+            let reference = match pkg.reference.as_deref() {
+                Some(r) => r,
+                None => continue,
+            };
+            let entries = by_pkg.get(&pkg.name).cloned().unwrap_or_default();
+            let payload = PackageClassmap {
+                version: 1,
+                entries,
+            };
+            if let Err(e) = pkg_cache_ref.save(&pkg.name, reference, &payload) {
+                tracing::warn!(
+                    "could not save classmap cache for {}: {e}",
+                    pkg.name
+                );
+            }
+        }
+    }
+
     let stats = DumpStats {
         walked: walked.len(),
         hits: hits.load(Ordering::Relaxed),
@@ -151,8 +291,28 @@ pub fn build_classmap(opts: &DumpOptions) -> Result<(ResolvedConfig, ClassMap, D
         errors: errors.load(Ordering::Relaxed),
         classes: map.len(),
         elapsed_ms: started.elapsed().as_millis(),
+        package_cache_hits: pkg_hits.load(Ordering::Relaxed),
+        package_cache_misses: pkg_misses.load(Ordering::Relaxed),
     };
     Ok((cfg, map, stats))
+}
+
+/// Merge a per-package cache hit into the global classmap. First-wins
+/// semantics for FQCN collisions, mirroring how the walked path
+/// inserts via `or_insert`.
+fn merge_cached_into_map(
+    cached: &PackageClassmap,
+    pkg_root: &Path,
+    map: &Mutex<ClassMap>,
+) {
+    if cached.entries.is_empty() {
+        return;
+    }
+    let mut m = map.lock().unwrap();
+    for (fqcn, relpath) in &cached.entries {
+        let abs = pkg_root.join(relpath);
+        m.entry(fqcn.clone()).or_insert(abs);
+    }
 }
 
 /// Standalone dump-autoload — patches the existing autoload_static.php and

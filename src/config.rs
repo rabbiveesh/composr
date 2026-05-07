@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Parsed `autoload` section of a composer.json (or `autoload-dev`).
@@ -70,6 +70,12 @@ pub struct PackageAutoload {
     /// PSR-0 `target-dir` legacy escape hatch — only ever set on the root package
     /// historically. Kept for completeness; we don't use it for classmap purposes.
     pub target_dir: Option<String>,
+    /// `dist.reference` (or `source.reference`) from
+    /// `vendor/composer/installed.json` — a stable per-version content
+    /// fingerprint, used as the cache key for the per-package classmap
+    /// cache. `None` for the root package, path-dist installs, or when
+    /// installed.json is absent / lacks a reference.
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,11 +94,14 @@ impl ResolvedConfig {
         })?;
         let vendor_dir = root.join("vendor");
 
+        let references = read_installed_references(&vendor_dir);
+
         let mut packages = Vec::new();
 
         let root_composer = root.join("composer.json");
         if root_composer.exists() {
-            packages.push(load_package(&root_composer, &root, include_dev)?);
+            // Root never has a reference — see PackageAutoload.reference docs.
+            packages.push(load_package(&root_composer, &root, include_dev, None)?);
         } else {
             anyhow::bail!("no composer.json at {}", root_composer.display());
         }
@@ -124,8 +133,14 @@ impl ResolvedConfig {
                     if composer_json.exists() {
                         // vendor packages never use autoload-dev (composer ignores it
                         // for non-root packages), so always pass false.
-                        match load_package(&composer_json, &pkg_path, false) {
-                            Ok(p) => packages.push(p),
+                        // Look up reference by package name (we use the
+                        // composer.json `name` field after loading; pre-flight
+                        // here we hand the whole map and let load_package pick).
+                        match load_package(&composer_json, &pkg_path, false, None) {
+                            Ok(mut p) => {
+                                p.reference = references.get(&p.name).cloned();
+                                packages.push(p);
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     "skipping malformed {}: {e}",
@@ -172,10 +187,64 @@ fn lexical_join(base: &Path, relative: &str) -> PathBuf {
     out
 }
 
+/// Build a name → reference map from `vendor/composer/installed.json`.
+/// Prefers `dist.reference`; falls back to `source.reference`. Skips
+/// `dist.type == "path"` because path-installed packages have no stable
+/// reference. Empty map if installed.json is absent or malformed —
+/// callers treat missing references as "uncacheable", so this degrades
+/// gracefully (we just skip the per-package classmap cache).
+fn read_installed_references(vendor_dir: &Path) -> HashMap<String, String> {
+    let path = vendor_dir.join("composer").join("installed.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return HashMap::new(),
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let packages = v
+        .get("packages")
+        .and_then(|x| x.as_array())
+        .or_else(|| v.as_array());
+    let Some(packages) = packages else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::with_capacity(packages.len());
+    for p in packages {
+        let Some(name) = p.get("name").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        // Path installs have a synthetic reference but the contents may
+        // change between runs without it changing — don't cache.
+        if p.get("dist").and_then(|d| d.get("type")).and_then(|x| x.as_str())
+            == Some("path")
+        {
+            continue;
+        }
+        let reference = p
+            .get("dist")
+            .and_then(|d| d.get("reference"))
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                p.get("source")
+                    .and_then(|s| s.get("reference"))
+                    .and_then(|x| x.as_str())
+            });
+        if let Some(r) = reference {
+            if !r.is_empty() {
+                out.insert(name.to_string(), r.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn load_package(
     composer_json: &Path,
     pkg_root: &Path,
     include_dev: bool,
+    reference: Option<String>,
 ) -> Result<PackageAutoload> {
     let bytes = std::fs::read(composer_json)
         .with_context(|| format!("reading {}", composer_json.display()))?;
@@ -236,5 +305,6 @@ fn load_package(
         files,
         exclude_from_classmap: excludes,
         target_dir: parsed.target_dir,
+        reference,
     })
 }

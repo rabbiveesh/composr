@@ -12,33 +12,59 @@ Working end-to-end on real apps. Two production-shape Laravel codebases
 place of `composer install`, with output (vendor tree, autoload bootstrap,
 packages.php) that's byte-equivalent to composer's own.
 
-Latest measured cold-install on monolith-app (292 packages, dist cache warm):
+Latest measured on monolith-app (292 packages):
 
-|                          | composer | composr |
-|--------------------------|---------:|--------:|
-| Cold install end-to-end  |    ~72s  | ~25–30s |
-| `package:discover` step  |    ~30s  |    ~5ms |
-| Composer subprocess calls|       —  |       0 |
+|                                   | composer | composr |
+|-----------------------------------|---------:|--------:|
+| Cold-cold (no caches at all)      |    ~72s  |    ~33s |
+| Warm dist + classmap cache, wiped vendor | — |    ~16s |
+| Warm everything (touch one app file) |   —   |  ~600ms |
+| `package:discover` step           |    ~30s  |    ~5ms |
+| Composer subprocess calls         |        — |       0 |
 
 Zero composer subprocess calls means the post-autoload-dump event is being
 fully handled natively (see "Hybrid mode" below).
 
-Per-stage breakdown of one cold-install run (set `COMPOSR_TIMING=1` to
-print these to stderr yourself):
+Per-stage breakdown of a single install run (set `COMPOSR_TIMING=1` to
+print these to stderr yourself). Two snapshots:
 
 ```
-STAGE download: 2ms        # cache hits, no real I/O
-STAGE extract (289 zips): ~14s  # zip extraction, parallel via rayon
-STAGE metadata: 9ms        # installed.json + installed.php
-STAGE bootstrap: ~12s      # parallel classmap walk + emit autoload files
-STAGE scripts: 30ms        # native discover + rm -f, no composer call
+# Cold-cold: no vendor, no classmap cache, dist cache warm
+STAGE download: 2ms
+STAGE extract (289 zips): ~14s   # zip extraction, parallel via rayon
+STAGE metadata: 9ms
+STAGE bootstrap: ~20s            # walk + parse + write per-package cache
+STAGE scripts: 30ms
+
+# After the first run: vendor wiped, classmap cache populated
+STAGE download: 5ms
+STAGE extract (289 zips): ~14s
+STAGE metadata: 9ms
+STAGE bootstrap: ~2.3s           # 292 cache hits, no walk, no parse
+STAGE scripts: 35ms
+
+# Warm everything (re-run, nothing or one app file changed)
+STAGE bootstrap: ~600ms          # only the root package walked
 ```
 
-Remaining wall-clock is split roughly half-and-half between extract and
-classmap walk. CPU usage during extract on an M-series Mac sits around
-~2.5 cores — the per-archive `zip` decompression is single-threaded, so
-extracting many in parallel only scales until disk metadata throughput
-or the largest single archive becomes the limit.
+Two layers of classmap caching make the difference:
+
+- **Per-package shared cache** at `$XDG_CACHE_HOME/composr/classmap/<package>/<sha1(reference)>.bin`,
+  keyed by `(package_name, dist.reference)`. Survives `rm -rf vendor`. A
+  hit means we skip walk + parse + admission for that package entirely
+  and merge cached classmap entries straight into the global map.
+- **Per-file mtime cache** at `vendor/composer/.classmap-cache.bin` for
+  the root package and any uncacheable packages (path-installs, no
+  reference). Same `(mtime_ns, size)` fingerprint as before.
+
+Together they make the "I changed one app file, run install" loop a
+sub-second operation, while still being byte-identical to composer's
+classmap output on cache hits and misses.
+
+Remaining wall-clock on cold-cold is dominated by zip extraction (~14s,
+parallel via rayon — bound by disk metadata throughput / largest single
+archive on M-series Macs). Classmap walking is no longer on the
+critical path after the first run.
 
 ## Subcommands
 
