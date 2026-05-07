@@ -1,11 +1,22 @@
+pub mod auth;
+pub mod binsetup;
 pub mod cache;
 pub mod config;
+pub mod diff;
+pub mod dist_cache;
+pub mod download;
+pub mod dump;
 pub mod emit;
+pub mod extract;
 pub mod filter;
+pub mod install;
+pub mod installed;
+pub mod lock;
 pub mod parse;
+pub mod scripts;
 pub mod walk;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -26,4 +37,19 @@ pub struct Options {
     pub verbose: bool,
     pub dry_run: bool,
     pub threads: Option<usize>,
+}
+
+/// Convenience helper used by the install pipeline: run dump-autoload with
+/// the same defaults as the CLI's no-flag invocation, but with the dev flag
+/// chosen by the caller.
+pub fn dump_autoload(root: &Path, with_dev: bool) -> anyhow::Result<()> {
+    dump::dump(dump::DumpOptions {
+        root: root.to_path_buf(),
+        cache_path: None,
+        with_dev,
+        no_cache: false,
+        dry_run: false,
+        output_dir: None,
+    })?;
+    Ok(())
 }

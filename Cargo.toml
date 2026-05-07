@@ -1,5 +1,5 @@
 [package]
-name = "composer-classmap-rs"
+name = "autoload-dumpr"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
@@ -7,11 +7,11 @@ description = "Fast, incremental Rust replacement for `composer dump-autoload -o
 license = "MIT"
 
 [[bin]]
-name = "composer-classmap-rs"
+name = "autoload-dumpr"
 path = "src/main.rs"
 
 [lib]
-name = "composer_classmap_rs"
+name = "autoload_dumpr"
 path = "src/lib.rs"
 
 [dependencies]
@@ -23,7 +23,9 @@ rayon = "1.10"
 tree-sitter = "0.22"
 tree-sitter-php = "0.22"
 bincode = { version = "2", features = ["serde"] }
+sha1 = "0.10"
 sha2 = "0.10"
+hex = "0.4"
 globset = "0.4"
 anyhow = "1"
 thiserror = "1"
@@ -32,9 +34,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 memchr = "2"
 fs2 = "0.4"
 num_cpus = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
+futures = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate", "bzip2"] }
+tempfile = "3"
+indicatif = "0.17"
+url = "2"
 
 [dev-dependencies]
-tempfile = "3"
 pretty_assertions = "1"
 
 [profile.release]
