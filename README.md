@@ -23,6 +23,20 @@ Latest measured cold-install on monolith-app (292 packages, dist cache warm):
 Zero composer subprocess calls means the post-autoload-dump event is being
 fully handled natively (see "Hybrid mode" below).
 
+Per-stage breakdown of one cold-install run (set `COMPOSR_TIMING=1` to
+print these to stderr yourself):
+
+```
+STAGE download: 2ms        # cache hits, no real I/O
+STAGE extract (289 zips): ~33s  # serial zip extraction — current bottleneck
+STAGE metadata: 12ms       # installed.json + installed.php
+STAGE bootstrap: ~11s      # parallel classmap walk + emit autoload files
+STAGE scripts: 28ms        # native discover + rm -f, no composer call
+```
+
+So the remaining time is ~75% zip extraction (currently a serial loop —
+parallelizing it is the next obvious lever) and ~25% classmap walk.
+
 ## Subcommands
 
 ```

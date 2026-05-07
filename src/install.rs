@@ -76,6 +76,12 @@ pub struct InstallReport {
 
 pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     let started = Instant::now();
+    // Per-stage timing breakdown to stderr when COMPOSR_TIMING is set in the
+    // environment (any non-empty value). Useful when investigating where
+    // cold-install time is going — see README.
+    let timing = std::env::var("COMPOSR_TIMING")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     let root = opts.root.canonicalize().with_context(|| {
         format!("canonicalizing project root {}", opts.root.display())
     })?;
@@ -231,6 +237,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
 
     let cache = DistCache::discover(opts.cache_dir.clone())?;
     let auth = AuthConfig::load(&root)?;
+    let t_download = Instant::now();
     let download_outcomes = if zip_installs.is_empty() {
         Vec::new()
     } else {
@@ -243,6 +250,9 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             .block_on(downloader.fetch_all(&zip_installs, true))
             .context("downloading dist archives")?
     };
+    if timing {
+        eprintln!("STAGE download: {}ms", t_download.elapsed().as_millis());
+    }
     let cache_path_by_name: HashMap<String, &DownloadOutcome> = download_outcomes
         .iter()
         .map(|o| (o.package_name.clone(), o))
@@ -258,6 +268,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     }
 
     // Zip installs.
+    let t_extract = Instant::now();
     for pkg in &zip_installs {
         let outcome = cache_path_by_name.get(&pkg.name).ok_or_else(|| {
             anyhow!("internal: no download outcome for {}", pkg.name)
@@ -272,6 +283,13 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &bin_dir,
             &vendor_dir,
         )?;
+    }
+    if timing {
+        eprintln!(
+            "STAGE extract ({} zips): {}ms",
+            zip_installs.len(),
+            t_extract.elapsed().as_millis()
+        );
     }
 
     // Path installs (local sibling dirs from `repositories[type=path]`).
@@ -308,6 +326,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     }
 
     // Persist installed metadata.
+    let t_metadata = Instant::now();
     let installed_payload = build_installed_json(&lock, opts.dev);
     write_installed_json(&installed_json_path, &installed_payload)?;
     // Composer's runtime InstalledVersions class — copied from composer's
@@ -337,7 +356,11 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         .with_context(|| format!("writing {}", installed_php_tmp.display()))?;
     std::fs::rename(&installed_php_tmp, &installed_php_path)
         .with_context(|| format!("renaming into {}", installed_php_path.display()))?;
+    if timing {
+        eprintln!("STAGE metadata: {}ms", t_metadata.elapsed().as_millis());
+    }
 
+    let t_bootstrap = Instant::now();
     // Autoload generation. Two paths:
     //   - Bootstrap-needed (cold start — autoload.php / ClassLoader.php /
     //     etc. don't exist): generate the full bootstrap natively. We do
@@ -384,7 +407,11 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         crate::dump_autoload(&root, opts.dev)
             .context("running dump-autoload after install")?;
     }
+    if timing {
+        eprintln!("STAGE bootstrap: {}ms", t_bootstrap.elapsed().as_millis());
+    }
 
+    let t_scripts = Instant::now();
     if !opts.no_scripts {
         run_event(
             Lifecycle::PostAutoloadDump,
@@ -406,6 +433,9 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &mut composer_calls,
             opts.no_discover,
         )?;
+    }
+    if timing {
+        eprintln!("STAGE scripts: {}ms", t_scripts.elapsed().as_millis());
     }
 
     Ok(InstallReport {
