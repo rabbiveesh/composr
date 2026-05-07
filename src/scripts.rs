@@ -85,7 +85,10 @@ impl<'a> Runner<'a> {
         Ok(outcome)
     }
 
-    fn run_one(
+    /// Run a single script entry. Public so callers (e.g. install.rs's
+    /// post-autoload-dump interceptor) can drive entries one-by-one while
+    /// still substituting native handlers for specific lines.
+    pub fn run_one(
         &self,
         raw: &str,
         env: &mut HashMap<String, String>,

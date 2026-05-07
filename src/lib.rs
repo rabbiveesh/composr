@@ -5,6 +5,7 @@ pub mod cache;
 pub mod composer_shim;
 pub mod config;
 pub mod diff;
+pub mod discover;
 pub mod dist_cache;
 pub mod download;
 pub mod dump;

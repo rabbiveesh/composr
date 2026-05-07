@@ -31,7 +31,7 @@ use crate::installed::{
     write_installed_versions_php, InstalledJson,
 };
 use crate::lock::{Lock, LockedPackage};
-use crate::scripts::{Lifecycle, Runner};
+use crate::scripts::{Lifecycle, Runner, ScriptOutcome};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -56,6 +56,9 @@ pub struct InstallOptions {
     /// Override path to the composer binary. If unset, we look at
     /// COMPOSR_COMPOSER (or legacy AUTOLOAD_DUMPR_COMPOSER) and then PATH.
     pub composer_bin: Option<PathBuf>,
+    /// If true, skip the native `package:discover` interception. Useful as
+    /// an escape hatch if the heuristic mis-identifies a script entry.
+    pub no_discover: bool,
 }
 
 #[derive(Debug)]
@@ -212,6 +215,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &root,
             &composer_env,
             &mut composer_calls,
+            opts.no_discover,
         )?;
     }
 
@@ -390,6 +394,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &root,
             &composer_env,
             &mut composer_calls,
+            opts.no_discover,
         )?;
         run_event(
             Lifecycle::PostInstallCmd,
@@ -399,6 +404,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &root,
             &composer_env,
             &mut composer_calls,
+            opts.no_discover,
         )?;
     }
 
@@ -415,6 +421,14 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
 /// Run one lifecycle event. If the event has class-method entries (which
 /// require composer's EventDispatcher to dispatch correctly), shell out to
 /// `composer run-script <event>`. Otherwise use our native runner.
+///
+/// The post-autoload-dump event additionally gets a Laravel-aware fast path:
+/// when every entry is either a `package:discover` artisan invocation, the
+/// `Illuminate\Foundation\ComposerScripts::postAutoloadDump` clearCompiled
+/// handler, or a plain shell/php script, we run them all natively (replacing
+/// `package:discover` with a millisecond-scale Rust port). This is what
+/// turns the ~30s artisan call into ~5ms on monolith-app and skips the composer
+/// delegation entirely. `--no-discover` opts out.
 fn run_event(
     event: Lifecycle,
     runner: &Runner,
@@ -423,12 +437,20 @@ fn run_event(
     cwd: &std::path::Path,
     env: &HashMap<String, String>,
     composer_calls: &mut usize,
+    no_discover: bool,
 ) -> Result<()> {
     let key = event.key();
     let entries = match scripts_section.get(key) {
         Some(v) => v,
         None => return Ok(()),
     };
+
+    if !no_discover && matches!(event, Lifecycle::PostAutoloadDump) {
+        if let Some(result) = try_intercept_post_autoload_dump(runner, entries, cwd) {
+            return result;
+        }
+    }
+
     if entries_need_composer(entries) {
         match composer {
             Some(c) => {
@@ -450,6 +472,144 @@ fn run_event(
     }
     runner.dispatch(event)?;
     Ok(())
+}
+
+/// One step in the planned native execution of post-autoload-dump.
+enum PostAutoloadStep {
+    /// Run native discover with this base path. The vendor dir is always
+    /// the install pipeline's `<root>/vendor` (composer's CWD/vendor).
+    Discover { base_path: PathBuf },
+    /// Skip a known-safe class-method handler (currently just
+    /// `Illuminate\Foundation\ComposerScripts::postAutoloadDump`).
+    SkipKnownClassMethod(&'static str),
+    /// Run the entry through the existing native script runner (shell, @php,
+    /// @putenv, etc.).
+    Runner(String),
+}
+
+/// Try to plan a fully-native execution of the post-autoload-dump event.
+/// Returns `Some(_)` if every entry is classifiable; `None` if we hit an
+/// unknown class-method handler we'd need composer for.
+///
+/// The return type is `Option<Result<()>>` so the caller can distinguish
+/// "did not intercept" (`None`, fall through to existing logic) from
+/// "intercepted, succeeded/failed" (`Some(Ok)`/`Some(Err)`).
+fn try_intercept_post_autoload_dump(
+    runner: &Runner,
+    entries: &Value,
+    root: &std::path::Path,
+) -> Option<Result<()>> {
+    let list: Vec<String> = match entries {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => return None,
+    };
+
+    // We only attempt interception when the event actually contains a
+    // package:discover call — otherwise the existing path is fine.
+    if !list
+        .iter()
+        .any(|s| parse_package_discover(s.trim(), root).is_some())
+    {
+        return None;
+    }
+
+    let mut plan: Vec<PostAutoloadStep> = Vec::with_capacity(list.len());
+    for raw in &list {
+        let trimmed = raw.trim();
+        if trimmed == "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump" {
+            plan.push(PostAutoloadStep::SkipKnownClassMethod(
+                "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+            ));
+            continue;
+        }
+        if let Some(base) = parse_package_discover(trimmed, root) {
+            plan.push(PostAutoloadStep::Discover { base_path: base });
+            continue;
+        }
+        // Unknown class-method handler — bail out, let composer handle it.
+        if !trimmed.starts_with('@')
+            && !trimmed.contains(char::is_whitespace)
+            && trimmed.contains("::")
+        {
+            tracing::debug!(
+                "post-autoload-dump has unrecognized class-method `{trimmed}` — won't intercept"
+            );
+            return None;
+        }
+        plan.push(PostAutoloadStep::Runner(raw.clone()));
+    }
+
+    Some(execute_post_autoload_plan(runner, plan, root))
+}
+
+fn execute_post_autoload_plan(
+    runner: &Runner,
+    plan: Vec<PostAutoloadStep>,
+    root: &std::path::Path,
+) -> Result<()> {
+    let mut env_overrides: HashMap<String, String> = HashMap::new();
+    let mut outcome = ScriptOutcome::default();
+    let vendor_dir = root.join("vendor");
+    for step in plan {
+        match step {
+            PostAutoloadStep::SkipKnownClassMethod(name) => {
+                tracing::info!(
+                    "post-autoload-dump: skipping {name} natively (clearCompiled is redundant — discover regenerates packages.php)"
+                );
+            }
+            PostAutoloadStep::Discover { base_path } => {
+                let report = crate::discover::discover(crate::discover::DiscoverOptions {
+                    root: base_path.clone(),
+                    vendor_dir: Some(vendor_dir.clone()),
+                    manifest_path: None,
+                })
+                .with_context(|| {
+                    format!(
+                        "running native package:discover for base path {}",
+                        base_path.display()
+                    )
+                })?;
+                tracing::info!(
+                    "native package:discover wrote {} packages to {} ({}ms)",
+                    report.packages_in_manifest,
+                    report.manifest_path.display(),
+                    report.elapsed_ms
+                );
+            }
+            PostAutoloadStep::Runner(raw) => {
+                runner
+                    .run_one(&raw, &mut env_overrides, &mut outcome)
+                    .with_context(|| format!("script `{raw}` (event post-autoload-dump)"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recognize `@php <artisan-path> package:discover [args...]` and return the
+/// directory containing `artisan` — Laravel's `$basePath`. Returns `None`
+/// for any other entry shape.
+fn parse_package_discover(entry: &str, root: &std::path::Path) -> Option<PathBuf> {
+    let body = entry.strip_prefix("@php ")?.trim();
+    let mut parts = body.split_whitespace();
+    let artisan = parts.next()?;
+    let command = parts.next()?;
+    if command != "package:discover" {
+        return None;
+    }
+    // Composer scripts run with CWD = project root, so a relative artisan
+    // path resolves against `root`.
+    let artisan_path: PathBuf = if Path::new(artisan).is_absolute() {
+        PathBuf::from(artisan)
+    } else {
+        root.join(artisan)
+    };
+    let base = artisan_path.parent()?.to_path_buf();
+    Some(base)
 }
 
 /// Build the env we hand to composer when delegating. Composer reads
@@ -680,6 +840,51 @@ fn root_reference_for(root: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_package_discover_recognizes_artisan_invocations() {
+        let root = Path::new("/proj");
+        assert_eq!(
+            parse_package_discover("@php artisan package:discover --ansi", root),
+            Some(PathBuf::from("/proj"))
+        );
+        assert_eq!(
+            parse_package_discover("@php laravel-app/artisan package:discover", root),
+            Some(PathBuf::from("/proj/laravel-app"))
+        );
+        assert_eq!(
+            parse_package_discover(
+                "@php /abs/path/to/artisan package:discover --ansi",
+                root
+            ),
+            Some(PathBuf::from("/abs/path/to"))
+        );
+    }
+
+    #[test]
+    fn parse_package_discover_rejects_other_entries() {
+        let root = Path::new("/proj");
+        // class-method handler
+        assert_eq!(
+            parse_package_discover(
+                "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+                root
+            ),
+            None
+        );
+        // shell command
+        assert_eq!(parse_package_discover("rm -f bootstrap/cache/*.php", root), None);
+        // wrong artisan command
+        assert_eq!(
+            parse_package_discover("@php artisan migrate --force", root),
+            None
+        );
+        // not @php
+        assert_eq!(
+            parse_package_discover("@composer dump-autoload", root),
+            None
+        );
+    }
 
     #[test]
     fn md5_basic() {

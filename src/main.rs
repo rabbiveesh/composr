@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use composr::discover::{discover as run_discover, DiscoverOptions};
 use composr::dump::{dump as run_dump, DumpOptions};
 use composr::install::{run as run_install, InstallOptions};
 use clap::{Parser, Subcommand};
@@ -29,6 +30,9 @@ enum Cmd {
     DumpAutoload(DumpArgs),
     /// Install packages from composer.lock into vendor/.
     Install(InstallArgs),
+    /// Native Laravel `package:discover` — write
+    /// bootstrap/cache/packages.php from vendor/composer/installed.json.
+    Discover(DiscoverArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -79,6 +83,25 @@ struct InstallArgs {
     /// COMPOSR_COMPOSER (or legacy AUTOLOAD_DUMPR_COMPOSER) and PATH are checked.
     #[arg(long)]
     composer_bin: Option<PathBuf>,
+    /// Skip the native Laravel `package:discover` interception. With this
+    /// flag, post-autoload-dump runs through composer (or the native runner)
+    /// untouched.
+    #[arg(long)]
+    no_discover: bool,
+}
+
+#[derive(Parser, Debug)]
+struct DiscoverArgs {
+    /// Override `vendor/` location. Defaults to `<root>/vendor`. Useful for
+    /// project layouts where the Laravel base path lives inside a larger
+    /// composer project (e.g. `laravel-app/` under a vendor at the outer
+    /// root).
+    #[arg(long)]
+    vendor_dir: Option<PathBuf>,
+    /// Output path for packages.php. Defaults to
+    /// `<root>/bootstrap/cache/packages.php`.
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
 }
 
 fn main() {
@@ -161,6 +184,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 strict_plugins: args.strict_plugins,
                 no_composer: args.no_composer,
                 composer_bin: args.composer_bin,
+                no_discover: args.no_discover,
             })?;
             eprintln!(
                 "install: {} installed, {} removed ({} cached, {} fetched) in {}ms ({} composer call{})",
@@ -171,6 +195,20 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 report.elapsed_ms,
                 report.composer_calls,
                 if report.composer_calls == 1 { "" } else { "s" }
+            );
+            Ok(0)
+        }
+        Some(Cmd::Discover(args)) => {
+            let report = run_discover(DiscoverOptions {
+                root,
+                vendor_dir: args.vendor_dir,
+                manifest_path: args.manifest_path,
+            })?;
+            eprintln!(
+                "discover: {} packages → {} ({}ms)",
+                report.packages_in_manifest,
+                report.manifest_path.display(),
+                report.elapsed_ms
             );
             Ok(0)
         }
