@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use composr::discover::{discover as run_discover, DiscoverOptions};
 use composr::dump::{dump as run_dump, DumpOptions};
+use composr::bench_fs::{run as run_bench_fs, BenchOptions};
 use composr::install::{run as run_install, InstallOptions};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -40,6 +41,12 @@ enum Cmd {
     /// op. Bails silently when there's no composer.json at cwd.
     #[command(name = "git-hook")]
     GitHook(GitHookArgs),
+    /// Synthetic filesystem benchmark for picking a fast staging surface.
+    /// Runs an extract-shaped workload (parallel mkdirs + small file
+    /// writes + renames + rm -rf) against each given path and reports
+    /// per-phase timings. Use it to compare candidate locations.
+    #[command(name = "bench-fs")]
+    BenchFs(BenchFsArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -107,6 +114,26 @@ struct GitHookArgs {
     /// signature-compatibility with git's hook conventions but ignored.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     _trailing: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
+struct BenchFsArgs {
+    /// One or more candidate directories to benchmark. Each gets its own
+    /// row in the output table.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    /// Number of synthetic packages (one parallel task per package).
+    #[arg(long, default_value_t = 126)]
+    packages: usize,
+    /// Subdirectories per package.
+    #[arg(long, default_value_t = 50)]
+    dirs_per_pkg: usize,
+    /// Files per subdirectory.
+    #[arg(long, default_value_t = 18)]
+    files_per_dir: usize,
+    /// Bytes per file (constant payload).
+    #[arg(long, default_value_t = 3 * 1024)]
+    file_bytes: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -209,6 +236,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Some(Cmd::GitHook(args)) => Ok(run_git_hook(&root, &args.label)),
+        Some(Cmd::BenchFs(args)) => {
+            run_bench_fs(BenchOptions {
+                paths: args.paths,
+                packages: args.packages,
+                dirs_per_pkg: args.dirs_per_pkg,
+                files_per_dir: args.files_per_dir,
+                file_bytes: args.file_bytes,
+            })?;
+            Ok(0)
+        }
         Some(Cmd::Discover(args)) => {
             let report = run_discover(DiscoverOptions {
                 root,

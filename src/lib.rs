@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod bench_fs;
 pub mod binsetup;
 pub mod bootstrap;
 pub mod cache;
