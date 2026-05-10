@@ -232,7 +232,8 @@ and any composer-based project can use them.
   dump-autoload --emit-stats`, pipes the JSON stats through the
   pretty-printer for a single colored summary line. The label shows up
   in dim brackets at the start of the line so a git-hook caller can
-  identify itself.
+  identify itself. (Filename is a relic of the original `autoload-dumpr`
+  binary; the script itself drives `composr` now.)
 - **`_autoload_dumpr_pretty <label>`** — the formatter. Reads JSON
   stats on stdin, writes one colored summary line to stderr.
 - **`composer-dump-fast`** — drop-in for `composer dump-autoload -o`:
@@ -261,8 +262,8 @@ the new branch), while staying free when it didn't. `--no-scripts` is
 the default; remove it from the helper once you've audited that your
 project's `post-install-cmd` is safe to fire on every branch switch.
 
-Override binary paths via `$AUTOLOAD_DUMPR` (the dumper) and
-`$COMPOSR` (the install runner). `$NO_COLOR` is honored everywhere.
+Override the binary path via `$COMPOSR` (defaults to `composr` on PATH).
+`$NO_COLOR` is honored everywhere.
 
 ## Limitations & out-of-scope
 

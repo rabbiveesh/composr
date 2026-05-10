@@ -10,7 +10,7 @@
 #   composer-dump-fast [--no-dev] [--strict] [--verbose]
 #
 # Required on PATH:
-#   autoload-dumpr   (or set $AUTOLOAD_DUMPR to its absolute path)
+#   composr          (or set $COMPOSR to its absolute path)
 #   composer         (your existing shim — dockerized is fine)
 #
 # Notes:
@@ -23,10 +23,10 @@
 
 set -euo pipefail
 
-bin="${AUTOLOAD_DUMPR:-autoload-dumpr}"
+bin="${COMPOSR:-composr}"
 
 if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "composer-dump-fast: '$bin' not found on PATH (set \$AUTOLOAD_DUMPR to override)" >&2
+    echo "composer-dump-fast: '$bin' not found on PATH (set \$COMPOSR to override)" >&2
     exit 127
 fi
 if ! command -v composer >/dev/null 2>&1; then
@@ -48,12 +48,13 @@ composer run-script pre-autoload-dump --no-interaction 2>/dev/null || true
 # classmap would just produce a noisier failure.
 #
 # Use the shared runner when it's available (handles "starting…" preamble +
-# pretty result formatting); fall back to raw JSON if the helper is missing.
+# pretty result formatting); fall back to raw stats output if the helper
+# is missing.
 if command -v _autoload_dumpr_run >/dev/null 2>&1; then
-    AUTOLOAD_DUMPR="$bin" _autoload_dumpr_run composer-dump-fast \
+    COMPOSR="$bin" _autoload_dumpr_run composer-dump-fast \
         --root "$PWD" "$@"
 else
-    "$bin" --root "$PWD" --emit-stats "$@"
+    "$bin" dump-autoload --emit-stats --root "$PWD" "$@"
 fi
 
 # Laravel's post-autoload-dump hook lives here: package:discover, clearing

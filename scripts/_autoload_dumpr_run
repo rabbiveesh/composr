@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run `autoload-dumpr` with a styled "starting…" line up front so the user
-# knows something is happening. The pretty-printer overwrites that line in
-# place with the result when the JSON stats arrive, leaving a single clean
-# line in the terminal.
+# Run `composr dump-autoload --emit-stats` with a styled "starting…" line
+# up front so the user knows something is happening. The pretty-printer
+# overwrites that line in place with the result when the JSON stats
+# arrive, leaving a single clean line in the terminal.
 #
 # Usage:
-#   _autoload_dumpr_run <label> [autoload-dumpr args...]
+#   _autoload_dumpr_run <label> [composr dump-autoload args...]
 
 set -u
 
@@ -25,19 +25,13 @@ printf '%s[%s]%s  %sautoload%s %sstarting…%s\n' \
     "$CYAN_B" "$RESET" \
     "$DIM" "$RESET" >&2
 
-bin="${AUTOLOAD_DUMPR:-autoload-dumpr}"
+# Binary resolution: $COMPOSR (modern), then `composr` on PATH.
+bin="${COMPOSR:-composr}"
 if ! command -v "$bin" >/dev/null 2>&1; then
     exit 0
 fi
 
-# `2>&1` so warnings from autoload-dumpr flow through the formatter (which
-# prints them through unchanged); `|| true` so a non-zero exit from the dump
-# never breaks the calling git op or wrapper.
-#
-# `dump-autoload --emit-stats` is the modern composr/autoload-dumpr
-# subcommand form. The original (single-command) binary accepted
-# `--emit-stats` as a top-level flag; that path was lost when
-# subcommands landed. Anyone whose binary doesn't have `dump-autoload`
-# is running something older than `composr install`, which is
-# implausible at this point.
+# `2>&1` so warnings flow through the formatter (which prints them through
+# unchanged); `|| true` so a non-zero exit from the dump never breaks the
+# calling git op or wrapper.
 "$bin" dump-autoload --emit-stats "$@" 2>&1 | _autoload_dumpr_pretty "$label" || true

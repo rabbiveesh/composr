@@ -1,6 +1,6 @@
 [package]
 name = "composr"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Fast Rust install + dump-autoload for Composer projects (vowels not included)"
@@ -8,12 +8,6 @@ license = "MIT"
 
 [[bin]]
 name = "composr"
-path = "src/main.rs"
-
-# `autoload-dumpr` is kept as an alias binary so existing scripts that
-# invoke the old name keep working.
-[[bin]]
-name = "autoload-dumpr"
 path = "src/main.rs"
 
 [lib]

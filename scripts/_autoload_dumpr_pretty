@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Pretty-prints the JSON stats line emitted by `autoload-dumpr --emit-stats`.
+# Pretty-prints the JSON stats line emitted by `composr dump-autoload --emit-stats`.
 #
 # Usage:
-#   autoload-dumpr --emit-stats 2>&1 | _autoload_dumpr_pretty <label>
+#   composr dump-autoload --emit-stats 2>&1 | _autoload_dumpr_pretty <label>
 #
 # <label> is shown in dim brackets at the start of the line (e.g. the name of
 # the git hook or wrapper that invoked the dump). Lines that aren't the JSON
@@ -12,7 +12,7 @@
 
 set -u
 
-label="${1:-autoload-dumpr}"
+label="${1:-composr}"
 
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$'\033[0m'
