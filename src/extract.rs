@@ -129,6 +129,7 @@ fn path_relative_components(from: &Path, to: &Path) -> String {
 pub struct ExtractResult {
     pub install_path: PathBuf,
     pub bytes_extracted: u64,
+    pub entries_extracted: usize,
 }
 
 /// Top-level entry point: extract `archive` (a `.zip` on disk) into the
@@ -155,10 +156,10 @@ pub fn extract_zip_to_install_path(
     // Order: extract first, then swap in. install_path is untouched until
     // we know the new tree is on disk and ready, so a failed extract
     // leaves the old install in place rather than a half-deleted vendor.
-    let work = || -> Result<u64> {
+    let work = || -> Result<(u64, usize)> {
         fs::create_dir_all(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        let bytes = extract_zip_into(archive, &tmp)?;
+        let (bytes, entries) = extract_zip_into(archive, &tmp)?;
 
         let source = match single_top_dir(&tmp)? {
             Some(d) => d,
@@ -213,11 +214,11 @@ pub fn extract_zip_to_install_path(
             })?;
         }
 
-        Ok(bytes)
+        Ok((bytes, entries))
     };
 
-    let bytes = match work() {
-        Ok(b) => b,
+    let (bytes, entries) = match work() {
+        Ok(t) => t,
         Err(e) => {
             let _ = remove_dir_best_effort(&tmp);
             return Err(e);
@@ -229,6 +230,7 @@ pub fn extract_zip_to_install_path(
     Ok(ExtractResult {
         install_path: install_path.to_path_buf(),
         bytes_extracted: bytes,
+        entries_extracted: entries,
     })
 }
 
@@ -275,7 +277,9 @@ pub fn spawn_trash_cleanup(vendor_dir: &Path) {
     }
 }
 
-fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<u64> {
+/// Returns `(bytes_written, file_entries_extracted)`. Directory-only
+/// entries don't count toward the entries number — it's "files written".
+fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<(u64, usize)> {
     let f = fs::File::open(archive)
         .with_context(|| format!("opening {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(f)
@@ -357,7 +361,7 @@ fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<u64> {
             }
         }
     }
-    Ok(total)
+    Ok((total, entries.len()))
 }
 
 fn unique_tmp_dir(under: &Path) -> Result<PathBuf> {

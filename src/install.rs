@@ -39,6 +39,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -340,13 +341,19 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         .collect();
     sized.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
 
+    let total_entries = AtomicUsize::new(0);
     let extract_one = |pkg: &LockedPackage| -> Result<()> {
         let outcome = cache_path_by_name
             .get(&pkg.name)
             .ok_or_else(|| anyhow!("internal: no download outcome for {}", pkg.name))?;
         let install_path = vendor_dir.join(&pkg.name);
-        extract_zip_to_install_path(&outcome.cached_path, &install_path, &vendor_dir)
-            .with_context(|| format!("extracting {}", pkg.name))?;
+        let result = extract_zip_to_install_path(
+            &outcome.cached_path,
+            &install_path,
+            &vendor_dir,
+        )
+        .with_context(|| format!("extracting {}", pkg.name))?;
+        total_entries.fetch_add(result.entries_extracted, Ordering::Relaxed);
         binsetup::install_package_bins(
             &pkg.name,
             &install_path,
@@ -377,8 +384,9 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     spawn_trash_cleanup(&vendor_dir);
     if timing {
         eprintln!(
-            "STAGE extract ({} zips): {}ms",
+            "STAGE extract ({} zips, {} entries): {}ms",
             zip_installs.len(),
+            total_entries.load(Ordering::Relaxed),
             t_extract.elapsed().as_millis()
         );
     }
