@@ -26,7 +26,7 @@ use crate::diff::{compute_ops, Op};
 use crate::dist_cache::DistCache;
 use crate::download::{DownloadOutcome, Downloader};
 use crate::dump::{build_classmap, DumpOptions};
-use crate::extract::{extract_zip_to_install_path, install_path_package};
+use crate::extract::{extract_zip_to_install_path, install_path_package, spawn_trash_cleanup};
 use crate::installed::{
     build_installed_json, render_installed_php, write_installed_json,
     write_installed_versions_php, InstalledJson,
@@ -369,6 +369,12 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     if let Some(pb) = extract_pb {
         pb.finish_and_clear();
     }
+    // Async-trash cleanup: each replaced package's old contents got an
+    // instant `rename` into `vendor/.composr-trash-<rand>/` during extract.
+    // Fire a detached `rm -rf` over all of them now (plus any orphans
+    // from prior incomplete runs); the child outlives this process so
+    // the user-visible install time excludes the actual recursive remove.
+    spawn_trash_cleanup(&vendor_dir);
     if timing {
         eprintln!(
             "STAGE extract ({} zips): {}ms",

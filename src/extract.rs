@@ -135,41 +135,88 @@ pub struct ExtractResult {
 /// final install path under `vendor_dir`. Uses a unique temp dir under
 /// `vendor_dir/composer/` so plugin or installer dirs in vendor don't
 /// leak into staging, and so finalize is a same-volume `rename`.
+///
+/// Replaces the existing `install_path` via async-trash: the old contents
+/// get an instant `rename` into a vendor-local `.composr-trash-<rand>/`
+/// entry, and the actual recursive remove happens in a detached process
+/// kicked off by [`spawn_trash_cleanup`] at the end of the install run.
+/// This keeps the foreground extract path off the rm-rf hot loop, which
+/// for a 113k-entry replace is otherwise a ~12s wait.
 pub fn extract_zip_to_install_path(
     archive: &Path,
     install_path: &Path,
     vendor_dir: &Path,
 ) -> Result<ExtractResult> {
-    // Replace the existing install_path. CRITICAL: if it's a symlink (e.g.
-    // a path-dist install we're now switching to zip), only remove the link
-    // — never touch the link target, which is the user's source dir.
-    if install_path.is_symlink() {
-        fs::remove_file(install_path).with_context(|| {
-            format!("removing existing symlink {}", install_path.display())
-        })?;
-    } else if install_path.exists() {
-        if vendor_dir.starts_with(install_path) {
-            bail!(
-                "refusing to empty {} because vendor dir lives inside it",
-                install_path.display()
-            );
-        }
-        empty_dir(install_path).with_context(|| {
-            format!("emptying existing dir {}", install_path.display())
-        })?;
-    }
-
     let composer_dir = vendor_dir.join("composer");
     fs::create_dir_all(&composer_dir)
         .with_context(|| format!("creating {}", composer_dir.display()))?;
     let tmp = unique_tmp_dir(&composer_dir)?;
 
-    let extract = || -> Result<u64> {
+    // Order: extract first, then swap in. install_path is untouched until
+    // we know the new tree is on disk and ready, so a failed extract
+    // leaves the old install in place rather than a half-deleted vendor.
+    let work = || -> Result<u64> {
         fs::create_dir_all(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        extract_zip_into(archive, &tmp)
+        let bytes = extract_zip_into(archive, &tmp)?;
+
+        let source = match single_top_dir(&tmp)? {
+            Some(d) => d,
+            None => tmp.clone(),
+        };
+
+        if let Some(parent) = install_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent {}", parent.display()))?;
+        }
+
+        // Move the existing install_path out of the way. CRITICAL: if it's
+        // a symlink (a path-dist install we're switching to zip), only
+        // remove the link — never touch the link target, which is the
+        // user's source dir.
+        if install_path.is_symlink() {
+            fs::remove_file(install_path).with_context(|| {
+                format!("removing existing symlink {}", install_path.display())
+            })?;
+        } else if install_path.exists() {
+            if vendor_dir.starts_with(install_path) {
+                bail!(
+                    "refusing to trash {} because vendor dir lives inside it",
+                    install_path.display()
+                );
+            }
+            let trash = unique_dir(vendor_dir, ".composr-trash-")?;
+            fs::rename(install_path, &trash).with_context(|| {
+                format!(
+                    "trashing {} -> {}",
+                    install_path.display(),
+                    trash.display()
+                )
+            })?;
+        }
+
+        // Move the new tree into place. Same volume (tmp lives under
+        // vendor/composer/), so rename almost always wins; copy is the
+        // cross-fs fallback.
+        if let Err(e) = fs::rename(&source, install_path) {
+            tracing::debug!(
+                "rename failed ({e}), falling back to copy: {} -> {}",
+                source.display(),
+                install_path.display()
+            );
+            copy_dir_recursive(&source, install_path).with_context(|| {
+                format!(
+                    "copying {} -> {}",
+                    source.display(),
+                    install_path.display()
+                )
+            })?;
+        }
+
+        Ok(bytes)
     };
-    let bytes = match extract() {
+
+    let bytes = match work() {
         Ok(b) => b,
         Err(e) => {
             let _ = remove_dir_best_effort(&tmp);
@@ -177,39 +224,55 @@ pub fn extract_zip_to_install_path(
         }
     };
 
-    let source = match single_top_dir(&tmp)? {
-        Some(d) => d,
-        None => tmp.clone(),
-    };
-
-    if let Some(parent) = install_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent {}", parent.display()))?;
-    }
-    if install_path.exists() {
-        let _ = fs::remove_dir(install_path);
-    }
-    if let Err(e) = fs::rename(&source, install_path) {
-        tracing::debug!(
-            "rename failed ({e}), falling back to copy: {} -> {}",
-            source.display(),
-            install_path.display()
-        );
-        copy_dir_recursive(&source, install_path).with_context(|| {
-            format!(
-                "copying {} -> {}",
-                source.display(),
-                install_path.display()
-            )
-        })?;
-    }
-
     let _ = remove_dir_best_effort(&tmp);
 
     Ok(ExtractResult {
         install_path: install_path.to_path_buf(),
         bytes_extracted: bytes,
     })
+}
+
+/// Spawn a detached `/bin/rm -rf` over every `<vendor>/.composr-trash-*/`
+/// entry (both this run's trash and any orphans from prior incomplete
+/// runs). Returns immediately; the child outlives this process — on
+/// Unix it gets reparented to launchd/init when we exit.
+///
+/// Idempotent: if no trash dirs exist, this is a no-op. Safe to call
+/// even if the previous install bailed mid-rename.
+pub fn spawn_trash_cleanup(vendor_dir: &Path) {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(vendor_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".composr-trash-")
+            {
+                paths.push(entry.path());
+            }
+        }
+    }
+    if paths.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let mut cmd = std::process::Command::new("/bin/rm");
+        cmd.arg("-rf");
+        for p in &paths {
+            cmd.arg(p);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let _ = cmd.spawn();
+    }
+    #[cfg(not(unix))]
+    {
+        for p in &paths {
+            let _ = fs::remove_dir_all(p);
+        }
+    }
 }
 
 fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<u64> {
@@ -298,6 +361,10 @@ fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<u64> {
 }
 
 fn unique_tmp_dir(under: &Path) -> Result<PathBuf> {
+    unique_dir(under, ".dumpr-")
+}
+
+fn unique_dir(under: &Path, prefix: &str) -> Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
@@ -306,7 +373,7 @@ fn unique_tmp_dir(under: &Path) -> Result<PathBuf> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(under.join(format!(".dumpr-{pid}-{now:x}-{n}")))
+    Ok(under.join(format!("{prefix}{pid}-{now:x}-{n}")))
 }
 
 fn has_traversal(p: &Path) -> bool {
@@ -334,24 +401,6 @@ fn single_top_dir(dir: &Path) -> Result<Option<PathBuf>> {
     } else {
         Ok(None)
     }
-}
-
-fn empty_dir(dir: &Path) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && !path.is_symlink() {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("rm -rf {}", path.display()))?;
-        } else {
-            fs::remove_file(&path)
-                .with_context(|| format!("rm {}", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 fn remove_dir_best_effort(dir: &Path) -> Result<()> {
