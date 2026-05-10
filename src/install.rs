@@ -322,23 +322,11 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         None
     };
 
-    // Sort by compressed size and split: huge packages run sequentially on
-    // one thread (largest first), small packages fill the remaining threads
-    // in parallel. This pipelines a single big package against the small
-    // tail without letting multiple big extractions compete for memory + IO.
-    // Threshold tunable via COMPOSR_HUGE_THRESHOLD_MB (default 5MB).
-    //
-    // Why this shape: rayon doesn't expose "is another thread currently in
-    // a huge job?" mid-flight, so we enforce the constraint structurally —
-    // one closure runs serially, the other parallel, and `rayon::join`
-    // schedules both on the same pool concurrently.
-    let huge_threshold_bytes: u64 = std::env::var("COMPOSR_HUGE_THRESHOLD_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5)
-        * 1024
-        * 1024;
-    let sized: Vec<(&LockedPackage, u64)> = zip_installs
+    // Sort by compressed size descending and run as a single LPT-scheduled
+    // `par_iter`. Largest archives kick off first; rayon's work-stealing
+    // (with `with_max_len(1)` making each archive its own stealable task)
+    // backfills around them.
+    let mut sized: Vec<(&LockedPackage, u64)> = zip_installs
         .iter()
         .copied()
         .map(|pkg| {
@@ -350,10 +338,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             (pkg, size)
         })
         .collect();
-    let (mut huge, small): (Vec<_>, Vec<_>) = sized
-        .into_iter()
-        .partition(|(_, s)| *s >= huge_threshold_bytes);
-    huge.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    sized.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
 
     let extract_one = |pkg: &LockedPackage| -> Result<()> {
         let outcome = cache_path_by_name
@@ -376,36 +361,11 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         Ok(())
     };
 
-    // Only activate the serial-huge / parallel-small split when smalls
-    // can actually keep the pool busy alongside the serial huge stream.
-    // Heuristic: throttle iff `small.len() >= cores` (and there's a huge
-    // to serialize). With fewer smalls than cores, the parallel arm would
-    // drain in a fraction of huge wall time and leave most threads idle —
-    // a plain `par_iter` over everything wins both makespan and simplicity.
-    let cores = rayon::current_num_threads();
-    let throttle = !huge.is_empty() && small.len() >= cores;
     let t_extract = Instant::now();
-    if !throttle {
-        huge.par_iter()
-            .chain(small.par_iter())
-            .try_for_each(|(pkg, _)| extract_one(pkg))?;
-    } else {
-        let (r_huge, r_small) = rayon::join(
-            || -> Result<()> {
-                for (pkg, _) in &huge {
-                    extract_one(pkg)?;
-                }
-                Ok(())
-            },
-            || -> Result<()> {
-                small
-                    .par_iter()
-                    .try_for_each(|(pkg, _)| extract_one(pkg))
-            },
-        );
-        r_huge?;
-        r_small?;
-    }
+    sized
+        .par_iter()
+        .with_max_len(1)
+        .try_for_each(|(pkg, _)| extract_one(pkg))?;
     if let Some(pb) = extract_pb {
         pb.finish_and_clear();
     }
