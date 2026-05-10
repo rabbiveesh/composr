@@ -1,56 +1,16 @@
 #!/usr/bin/env bash
-# Keep `vendor/` and the autoload classmap in sync with the working
-# tree after a git op (checkout / merge / rewrite).
+# Back-compat shim. The hook logic now lives in the `composr` binary as
+# `composr git-hook <label>` — this script just forwards to it so any
+# existing hook files calling `_composr_git_hook` keep working.
 #
-# Always runs `composr install --no-scripts`. We used to short-circuit
-# on a ref-to-ref `composer.lock` diff (cheap classmap refresh when
-# unchanged), but that missed the most common real failure mode: lock
-# unchanged across the two refs, but vendor on disk is stale relative
-# to that lock (because vendor was last installed long before). The
-# user noticed it as "manual `composr install` does an install but the
-# hook didn't" — exactly that scenario. `composr install` is
-# idempotent and ~700ms warm-cache when there's nothing to do, so the
-# correctness is worth the 400ms over the old refresh-only path.
-#
-# `--no-scripts` is the conservative default — drop the flag if you've
-# audited that your project's `post-install-cmd` / `post-autoload-dump`
-# are safe to fire on every branch switch.
-#
-# Usage:
-#   _composr_git_hook <label> [unused] [unused]
-#
-# <label> is shown as a dim-bracketed prefix on the preamble line so
-# the caller can identify itself (e.g. "post-checkout"). The two
-# trailing args are accepted for compat with the previous signature
-# but ignored.
-#
-# Override paths:
-#   $COMPOSR — path to the composr binary (default: `composr` on PATH).
+# New hook files should call `composr git-hook <label>` directly and skip
+# this script entirely (one less thing to install on $PATH).
 
 set -u
 
 label="${1:?label required}"
-
 composr="${COMPOSR:-composr}"
 if ! command -v "$composr" >/dev/null 2>&1; then
     exit 0
 fi
-
-# Must be in a git repo + have a composer.json at PWD; bail silently
-# otherwise (e.g. hook fires from a non-PHP sibling repo).
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
-[ -f composer.json ] || exit 0
-
-# Pretty preamble so the user knows the lag is intentional. composr
-# install prints its own one-line summary when it finishes.
-if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
-    DIM=$'\033[2m'; CYAN_B=$'\033[1;36m'; RESET=$'\033[0m'
-else
-    DIM=""; CYAN_B=""; RESET=""
-fi
-printf '%s[%s]%s  %scomposr install%s %s(syncing vendor)%s\n' \
-    "$DIM" "$label" "$RESET" \
-    "$CYAN_B" "$RESET" \
-    "$DIM" "$RESET" >&2
-
-"$composr" install --root "$PWD" --no-scripts || true
+exec "$composr" git-hook "$label"

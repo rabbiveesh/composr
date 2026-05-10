@@ -222,48 +222,70 @@ golden-byte comparisons for both natively-replicated plugins
 (`pest-plugins.json` and `GeneratedServiceProviderData.php`) against
 real composer's output on a fixture lock.
 
+## Git hooks
+
+`composr git-hook <label>` runs `install --no-scripts` with a styled
+preamble line, suitable for `post-checkout` / `post-merge` /
+`post-rewrite`. It bails silently if there's no `composer.json` at cwd
+and always exits 0, so a sync that fails for any reason can't block the
+git op. The only thing you need on `$PATH` is `composr` itself.
+
+Drop these into `.git/hooks/` (mark `chmod +x`):
+
+```sh
+# .git/hooks/post-checkout
+#!/usr/bin/env bash
+[ "$3" = "1" ] || exit 0
+command -v composr >/dev/null 2>&1 || exit 0
+composr git-hook post-checkout
+```
+
+```sh
+# .git/hooks/post-merge
+#!/usr/bin/env bash
+command -v composr >/dev/null 2>&1 || exit 0
+composr git-hook post-merge
+```
+
+```sh
+# .git/hooks/post-rewrite
+#!/usr/bin/env bash
+cat >/dev/null     # drain stdin so we don't SIGPIPE the parent
+command -v composr >/dev/null 2>&1 || exit 0
+composr git-hook post-rewrite
+```
+
+Branch switches, pulls, and rebases will reconcile vendor + classmap
+automatically. `composr install` is idempotent and ~700ms warm-cache
+when there's nothing to do, so it's cheap to run on every git op.
+`--no-scripts` is the conservative default — drop it from the
+subcommand once you've audited that your project's `post-install-cmd`
+is safe to fire on every branch switch.
+
+`$COMPOSR` overrides the binary path (defaults to `composr` on PATH).
+`$NO_COLOR` is honored.
+
 ## Optional helper scripts (`scripts/`)
 
-A handful of repo-agnostic shell helpers live in `scripts/`. Drop the
-directory on `$PATH` (or symlink the individual files into `~/bin`)
-and any composer-based project can use them.
+A few extra shell helpers live in `scripts/` for cases the binary
+doesn't cover. Drop the directory on `$PATH` (or symlink individual
+files into `~/bin`) to use them.
 
-- **`_autoload_dumpr_run <label> [args...]`** — runs `composr
-  dump-autoload --emit-stats`, pipes the JSON stats through the
-  pretty-printer for a single colored summary line. The label shows up
-  in dim brackets at the start of the line so a git-hook caller can
-  identify itself. (Filename is a relic of the original `autoload-dumpr`
-  binary; the script itself drives `composr` now.)
-- **`_autoload_dumpr_pretty <label>`** — the formatter. Reads JSON
-  stats on stdin, writes one colored summary line to stderr.
 - **`composer-dump-fast`** — drop-in for `composer dump-autoload -o`:
   runs the native classmap dumper, then asks composer to fire
   pre/post-autoload-dump scripts (so Laravel's `package:discover` and
-  friends still run).
-- **`_composr_git_hook <label> [prev_ref] [new_ref]`** — git-hook
-  helper. If `composer.lock` differs between `prev_ref..new_ref`, runs
-  `composr install --no-scripts` to sync vendor; otherwise just
-  refreshes the classmap. `prev_ref` defaults to `HEAD@{1}`, `new_ref`
-  to `HEAD` — correct for `post-merge` and `post-rewrite`.
-  `post-checkout` should pass git's `$1` and `$2` explicitly.
-
-Example `post-checkout` hook:
-
-```sh
-#!/usr/bin/env bash
-[ "$3" = "1" ] || exit 0
-command -v _composr_git_hook >/dev/null 2>&1 || exit 0
-_composr_git_hook post-checkout "$1" "$2"
-```
-
-This makes branch switches automatically reconcile vendor when the
-lock moved (so you don't get "class not found" on packages added in
-the new branch), while staying free when it didn't. `--no-scripts` is
-the default; remove it from the helper once you've audited that your
-project's `post-install-cmd` is safe to fire on every branch switch.
-
-Override the binary path via `$COMPOSR` (defaults to `composr` on PATH).
-`$NO_COLOR` is honored everywhere.
+  friends still run). Useful in CI flows that compose composr with a
+  partial composer dispatch.
+- **`_autoload_dumpr_run <label> [args...]`** /
+  **`_autoload_dumpr_pretty <label>`** — wrap `composr dump-autoload
+  --emit-stats` with a colored "starting…" preamble + one-line
+  summary, for git hooks or wrappers that want richer output than the
+  binary's default. (Filenames are a relic of the original
+  `autoload-dumpr` binary; both scripts drive `composr` now.)
+- **`_composr_git_hook <label> [unused] [unused]`** — back-compat
+  forwarder to `composr git-hook <label>`. Kept so hook files written
+  before the subcommand existed keep working; new ones should call
+  the subcommand directly.
 
 ## Limitations & out-of-scope
 

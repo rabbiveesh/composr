@@ -34,6 +34,12 @@ enum Cmd {
     /// Native Laravel `package:discover` — write
     /// bootstrap/cache/packages.php from vendor/composer/installed.json.
     Discover(DiscoverArgs),
+    /// Sync vendor + classmap after a git op (post-checkout / post-merge /
+    /// post-rewrite). Equivalent to `install --no-scripts` with a styled
+    /// preamble line; always exits 0 so a failed sync never blocks the git
+    /// op. Bails silently when there's no composer.json at cwd.
+    #[command(name = "git-hook")]
+    GitHook(GitHookArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -89,6 +95,18 @@ struct InstallArgs {
     /// untouched.
     #[arg(long)]
     no_discover: bool,
+}
+
+#[derive(Parser, Debug)]
+struct GitHookArgs {
+    /// Label shown in the preamble (e.g. "post-checkout"). Helps identify
+    /// which hook triggered the sync when scrolling back through terminal
+    /// output.
+    label: String,
+    /// Extra positional args from the hook (`$1`, `$2`, …) — accepted for
+    /// signature-compatibility with git's hook conventions but ignored.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _trailing: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -199,6 +217,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
+        Some(Cmd::GitHook(args)) => Ok(run_git_hook(&root, &args.label)),
         Some(Cmd::Discover(args)) => {
             let report = run_discover(DiscoverOptions {
                 root,
@@ -214,6 +233,58 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// Drive `composr install --no-scripts` for a git hook: print the styled
+/// preamble line so the user knows the lag is intentional, then run install
+/// and let its own one-line summary finish the output. Always returns 0 so
+/// a failed sync never blocks the git op (matches the old shell helper's
+/// `|| true` behavior).
+fn run_git_hook(root: &std::path::Path, label: &str) -> i32 {
+    use std::io::IsTerminal;
+    if !root.join("composer.json").is_file() {
+        return 0;
+    }
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let (dim, cyan_b, reset) = if color {
+        ("\x1b[2m", "\x1b[1;36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    eprintln!(
+        "{dim}[{label}]{reset}  {cyan_b}composr install{reset} {dim}(syncing vendor){reset}"
+    );
+
+    let concurrency = num_cpus::get().clamp(2, 12);
+    match run_install(InstallOptions {
+        root: root.to_path_buf(),
+        dev: true,
+        no_scripts: true,
+        dry_run: false,
+        concurrency,
+        cache_dir: None,
+        strict_plugins: false,
+        no_composer: false,
+        composer_bin: None,
+        no_discover: false,
+    }) {
+        Ok(report) => {
+            eprintln!(
+                "install: {} installed, {} removed ({} cached, {} fetched) in {}ms ({} composer call{})",
+                report.installed,
+                report.removed,
+                report.from_cache,
+                report.fetched,
+                report.elapsed_ms,
+                report.composer_calls,
+                if report.composer_calls == 1 { "" } else { "s" }
+            );
+        }
+        Err(e) => {
+            eprintln!("{dim}[{label}]{reset} install failed: {e:#} {dim}(continuing){reset}");
+        }
+    }
+    0
 }
 
 fn init_tracing(verbose: bool) {
