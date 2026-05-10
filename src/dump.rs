@@ -332,7 +332,7 @@ pub fn dump(opts: DumpOptions) -> Result<DumpStats> {
     Ok(stats)
 }
 
-fn write_outputs(
+pub fn write_outputs(
     root: &Path,
     vendor_dir: &Path,
     output_dir: &Path,

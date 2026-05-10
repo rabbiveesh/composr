@@ -148,6 +148,50 @@ Composer binary resolution order: `--composer-bin <path>`,
 delegation is needed, composr warns and continues with class-method
 handlers skipped.
 
+### Plugin policy
+
+Composer-plugin packages get installed as plain library files; whether
+their composer-side hooks run depends on the plugin:
+
+- **Natively replicated** — composr ports the plugin's install-time
+  codegen to Rust and writes the same artifact composer would. Output
+  is byte-equal to composer's plugin output (verified by golden tests
+  against real composer in the integration suite). Currently:
+  - `pestphp/pest-plugin` — writes `vendor/pest-plugins.json`. Without
+    it pest's runtime `Loader` returns `[]` and every Pest plugin
+    (Coverage, Bail, Cache, Retry, Snapshot, Parallel,
+    `pest-plugin-arch`, …) silently no-ops. Gated on the project's
+    `config.allow-plugins.pestphp/pest-plugin: true`.
+  - `tbachert/spi` — writes
+    `vendor/composer/GeneratedServiceProviderData.php` (and splices the
+    class into `autoload_classmap.php` / `autoload_static.php`).
+    Replicates the `extra.spi` data flow; recognizes
+    `#[Nevay\SPI\ServiceProviderDependency\PackageDependency]`
+    (statically evaluated against the lock) and
+    `#[…\ExtensionDependency]` (emitted as the runtime conditional
+    wrap). Gated on `config.allow-plugins.tbachert/spi: true`.
+    Limitations: doesn't replicate `extra.spi-config.autoload-files`
+    (which would require running PHP at install time); presence of any
+    such package logs a warning and falls through to delegation.
+- **Inert** — installing the files alone is sufficient; the
+  composer-side activation has no observable install-time effect for
+  the apps we run. Currently `php-http/discovery`,
+  `pestphp/pest-plugin-{laravel,mock,arch,type-coverage}`, and
+  `phpstan/extension-installer`.
+- **Unknown** — anything else. composr forces a `composer run-script
+  <event>` delegation per lifecycle event so the plugin's subscribers
+  still fire (assuming a `composer` binary is reachable; without one,
+  composr warns that those hooks won't run). Project-local exceptions
+  go in `composr.json` → `allow-inert-plugins` (supports `*` wildcards
+  matching composer's `BasePackage::packageNameToRegexp`):
+
+  ```json
+  { "allow-inert-plugins": ["vendor/some-plugin", "vendor/*", "*/util-*"] }
+  ```
+
+  `--strict-plugins` ignores all allowlists and refuses any
+  composer-plugin in the lock.
+
 ## Flags worth knowing
 
 `composr install`:
@@ -167,11 +211,16 @@ handlers skipped.
 cargo test
 ```
 
-68 unit tests at the time of writing, covering: PHP parsing edge cases
-(non-UTF-8 class names, anonymous classes, nested namespaces), classmap
-emission, autoload bootstrap files, lock parsing, install diff, dist
-extraction (zip + path-symlinks), script entry classification, and the
-discover algorithm + var_export output shape.
+121 unit tests + integration tests at the time of writing, covering:
+PHP parsing edge cases (non-UTF-8 class names, anonymous classes,
+nested namespaces), classmap emission, autoload bootstrap files, lock
+parsing, install diff, dist extraction (zip + path-symlinks), script
+entry classification, the discover algorithm + var_export output
+shape, PHP-compatible `json_encode` (default + `JSON_PRETTY_PRINT`,
+verified against PHP 8.5), `composr.json` glob-pattern matching, and
+golden-byte comparisons for both natively-replicated plugins
+(`pest-plugins.json` and `GeneratedServiceProviderData.php`) against
+real composer's output on a fixture lock.
 
 ## Optional helper scripts (`scripts/`)
 
@@ -219,21 +268,10 @@ Override binary paths via `$AUTOLOAD_DUMPR` (the dumper) and
 
 - **No `composer update`.** composr is lock-driven; you still need
   composer to refresh the lock against `composer.json`.
-- **Composer plugins install as inert files.** Their composer-side
-  activation hooks don't run. For the plugins we observe in our codebase
-  (`php-http/discovery`, `pestphp/pest-plugin`, `tbachert/spi`,
-  `phpstan/extension-installer`) the runtime parts continue to function;
-  install-time hooks aren't load-bearing. composr ships a built-in
-  allowlist of known-inert plugins and stays quiet about those; for
-  project-specific additions, drop a `composr.json` next to your
-  `composer.json`:
-
-  ```json
-  { "allow-inert-plugins": ["vendor/some-plugin"] }
-  ```
-
-  `--strict-plugins` ignores the allowlist and refuses any plugin in the
-  lock.
+- **Composer-plugin coverage.** See "Plugin policy" above for the full
+  story — pest-plugin and tbachert/spi are natively replicated; a small
+  allowlist is treated as inert; everything else gets delegated to
+  `composer run-script` per event.
 - **Platform-check stub.** `vendor/composer/platform_check.php` is
   emitted as a no-op. A correct implementation would emit php-version
   + ext-* checks from the lock's platform reqs.

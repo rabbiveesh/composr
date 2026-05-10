@@ -20,7 +20,7 @@
 use crate::auth::AuthConfig;
 use crate::binsetup;
 use crate::bootstrap::{write_bootstrap, BootstrapInput};
-use crate::composer_shim::{bootstrap_complete, entries_need_composer, Composer, INERT_ALLOWLIST};
+use crate::composer_shim::{bootstrap_complete, entries_need_composer, Composer};
 use crate::composr_config::ComposrConfig;
 use crate::diff::{compute_ops, Op};
 use crate::dist_cache::DistCache;
@@ -132,39 +132,30 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     }
 
     // Plugin policy. Strict mode bails on any composer-plugin in the lock,
-    // regardless of allowlists. In the default (relaxed) mode, surface the
-    // plugin names up front — but skip plugins on the hardcoded
-    // INERT_ALLOWLIST or the project-local allowlist (composr.json), since
-    // those are known-safe to install as inert files.
+    // regardless of allowlists. In the default (relaxed) mode, classify each
+    // plugin: known-inert (built-in [`INERT_ALLOWLIST`] or `composr.json`'s
+    // `allow-inert-plugins`) and natively-replicated ([`NATIVELY_REPLICATED_PLUGINS`])
+    // are silent. Anything else is "unknown" — its lifecycle subscribers may
+    // be load-bearing, so we'll force a `composer run-script` delegation per
+    // event when one is locked.
+    let composr_cfg = ComposrConfig::load(&root);
     let plugins: Vec<&LockedPackage> = lock
         .packages
         .iter()
         .filter(|p| p.package_type == "composer-plugin")
         .collect();
-    if !plugins.is_empty() {
+    if !plugins.is_empty() && opts.strict_plugins {
         let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
-        if opts.strict_plugins {
-            bail!(
-                "composer-plugin packages present in lock and --strict-plugins is set: {}",
-                names.join(", ")
-            );
-        }
-        let composr_cfg = ComposrConfig::load(&root);
-        let unknown: Vec<&str> = names
-            .iter()
-            .copied()
-            .filter(|n| {
-                !INERT_ALLOWLIST.contains(n)
-                    && !composr_cfg.allow_inert_plugins.iter().any(|a| a == n)
-            })
-            .collect();
-        if !unknown.is_empty() {
-            tracing::warn!(
-                "installing composer-plugin packages as inert files (their composer-side hooks won't run): {}",
-                unknown.join(", ")
-            );
-        }
+        bail!(
+            "composer-plugin packages present in lock and --strict-plugins is set: {}",
+            names.join(", ")
+        );
     }
+    let unknown_plugins: Vec<String> =
+        crate::composer_shim::unknown_plugins(&lock, &composr_cfg)
+            .into_iter()
+            .map(String::from)
+            .collect();
 
     let installed = InstalledJson::read(&installed_json_path)?;
     let ops = compute_ops(&lock, &installed, opts.dev);
@@ -229,6 +220,29 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     let mut composer_calls: usize = 0;
     let composer_env = composer_passthrough_env();
 
+    // Surface the unknown-plugin policy now that we know whether composer
+    // is reachable. With a composer binary, we'll delegate each lifecycle
+    // event so unknown subscribers fire correctly. Without one, those
+    // hooks won't run — the message has to reflect that.
+    if !unknown_plugins.is_empty() {
+        let joined = unknown_plugins.join(", ");
+        if composer.is_some() {
+            tracing::info!(
+                "composer-plugin(s) with unknown install-time hooks: {joined}; \
+                 lifecycle events will be delegated to `composer run-script`"
+            );
+        } else {
+            tracing::warn!(
+                "composer-plugin(s) with unknown install-time hooks: {joined}; \
+                 their composer-side hooks won't run (no composer binary available). \
+                 Add to `allow-inert-plugins` in composr.json to silence this warning."
+            );
+        }
+    }
+
+    let unknown_plugin_refs: Vec<&str> =
+        unknown_plugins.iter().map(String::as_str).collect();
+
     if !opts.no_scripts {
         run_event(
             Lifecycle::PreInstallCmd,
@@ -239,6 +253,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &composer_env,
             &mut composer_calls,
             opts.no_discover,
+            &unknown_plugin_refs,
         )?;
     }
 
@@ -307,29 +322,90 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         None
     };
 
-    let t_extract = Instant::now();
-    zip_installs
-        .par_iter()
-        .try_for_each(|pkg| -> Result<()> {
-            let outcome = cache_path_by_name
+    // Sort by compressed size and split: huge packages run sequentially on
+    // one thread (largest first), small packages fill the remaining threads
+    // in parallel. This pipelines a single big package against the small
+    // tail without letting multiple big extractions compete for memory + IO.
+    // Threshold tunable via COMPOSR_HUGE_THRESHOLD_MB (default 5MB).
+    //
+    // Why this shape: rayon doesn't expose "is another thread currently in
+    // a huge job?" mid-flight, so we enforce the constraint structurally —
+    // one closure runs serially, the other parallel, and `rayon::join`
+    // schedules both on the same pool concurrently.
+    let huge_threshold_bytes: u64 = std::env::var("COMPOSR_HUGE_THRESHOLD_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5)
+        * 1024
+        * 1024;
+    let sized: Vec<(&LockedPackage, u64)> = zip_installs
+        .iter()
+        .copied()
+        .map(|pkg| {
+            let size = cache_path_by_name
                 .get(&pkg.name)
-                .ok_or_else(|| anyhow!("internal: no download outcome for {}", pkg.name))?;
-            let install_path = vendor_dir.join(&pkg.name);
-            extract_zip_to_install_path(&outcome.cached_path, &install_path, &vendor_dir)
-                .with_context(|| format!("extracting {}", pkg.name))?;
-            binsetup::install_package_bins(
-                &pkg.name,
-                &install_path,
-                &pkg.bin,
-                &bin_dir,
-                &vendor_dir,
-            )?;
-            if let Some(pb) = &extract_pb {
-                pb.inc(1);
-                pb.set_message(format!("extracted {}", pkg.name));
-            }
-            Ok(())
-        })?;
+                .and_then(|o| std::fs::metadata(&o.cached_path).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            (pkg, size)
+        })
+        .collect();
+    let (mut huge, small): (Vec<_>, Vec<_>) = sized
+        .into_iter()
+        .partition(|(_, s)| *s >= huge_threshold_bytes);
+    huge.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+
+    let extract_one = |pkg: &LockedPackage| -> Result<()> {
+        let outcome = cache_path_by_name
+            .get(&pkg.name)
+            .ok_or_else(|| anyhow!("internal: no download outcome for {}", pkg.name))?;
+        let install_path = vendor_dir.join(&pkg.name);
+        extract_zip_to_install_path(&outcome.cached_path, &install_path, &vendor_dir)
+            .with_context(|| format!("extracting {}", pkg.name))?;
+        binsetup::install_package_bins(
+            &pkg.name,
+            &install_path,
+            &pkg.bin,
+            &bin_dir,
+            &vendor_dir,
+        )?;
+        if let Some(pb) = &extract_pb {
+            pb.inc(1);
+            pb.set_message(format!("extracted {}", pkg.name));
+        }
+        Ok(())
+    };
+
+    // Only activate the serial-huge / parallel-small split when smalls
+    // can actually keep the pool busy alongside the serial huge stream.
+    // Heuristic: throttle iff `small.len() >= cores` (and there's a huge
+    // to serialize). With fewer smalls than cores, the parallel arm would
+    // drain in a fraction of huge wall time and leave most threads idle —
+    // a plain `par_iter` over everything wins both makespan and simplicity.
+    let cores = rayon::current_num_threads();
+    let throttle = !huge.is_empty() && small.len() >= cores;
+    let t_extract = Instant::now();
+    if !throttle {
+        huge.par_iter()
+            .chain(small.par_iter())
+            .try_for_each(|(pkg, _)| extract_one(pkg))?;
+    } else {
+        let (r_huge, r_small) = rayon::join(
+            || -> Result<()> {
+                for (pkg, _) in &huge {
+                    extract_one(pkg)?;
+                }
+                Ok(())
+            },
+            || -> Result<()> {
+                small
+                    .par_iter()
+                    .try_for_each(|(pkg, _)| extract_one(pkg))
+            },
+        );
+        r_huge?;
+        r_small?;
+    }
     if let Some(pb) = extract_pb {
         pb.finish_and_clear();
     }
@@ -418,23 +494,48 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     //   - Otherwise: take the fast path — patch the existing
     //     autoload_static.php and rewrite autoload_classmap.php.
     //
-    // Plugin activation is no longer a delegation trigger — for the plugins
-    // we see in service-app/monolith-app (php-http/discovery, pestphp/pest-plugin,
-    // tbachert/spi) install-time hooks aren't load-bearing; their PHP
-    // code in vendor/ works at runtime without composer-side activation.
+    // For pre-autoload-dump plugins we replicate natively (currently
+    // tbachert/spi): build the classmap, run the plugin's codegen against
+    // it, then write the autoload outputs with the generated class spliced
+    // in. Both paths share the same shape so the SPI splice happens once.
     let needs_bootstrap = !bootstrap_complete(&vendor_dir);
-    let (autoload_stats, autoload_mode) = if needs_bootstrap {
+    let dump_opts = DumpOptions {
+        root: root.clone(),
+        cache_path: None,
+        with_dev: opts.dev,
+        no_cache: false,
+        dry_run: false,
+        output_dir: None,
+    };
+    let (cfg, mut classmap, autoload_stats) =
+        build_classmap(&dump_opts).context("computing classmap for autoload")?;
+
+    // pre-autoload-dump native replication for tbachert/spi.
+    if crate::spi::is_present(&lock, opts.dev) && crate::spi::is_allowed(&root_json) {
+        let unsupported = crate::spi::packages_with_autoload_files_spi(&lock, opts.dev);
+        if !unsupported.is_empty() {
+            tracing::warn!(
+                "skipping native SPI replication: packages use `extra.spi-config.autoload-files` \
+                 (require PHP at install time): {}",
+                unsupported.join(", ")
+            );
+        } else {
+            let mappings = crate::spi::collect(&lock, opts.dev, &root_json);
+            let body = crate::spi::render(&mappings, &lock, opts.dev, &classmap);
+            let path = crate::spi::write(&vendor_dir, &body)
+                .context("writing vendor/composer/GeneratedServiceProviderData.php")?;
+            let (key, value) = crate::spi::classmap_entry(&vendor_dir);
+            classmap.insert(key, value);
+            tracing::info!(
+                "wrote {} ({} services)",
+                path.display(),
+                mappings.services.len()
+            );
+        }
+    }
+
+    let autoload_mode = if needs_bootstrap {
         tracing::info!("autoload bootstrap missing — generating natively");
-        let dump_opts = DumpOptions {
-            root: root.clone(),
-            cache_path: None,
-            with_dev: opts.dev,
-            no_cache: false,
-            dry_run: false,
-            output_dir: None,
-        };
-        let (cfg, classmap, stats) = build_classmap(&dump_opts)
-            .context("computing classmap for bootstrap")?;
         let suffix = lock
             .content_hash
             .clone()
@@ -447,11 +548,16 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             suffix: &suffix,
         })
         .context("writing autoload bootstrap")?;
-        (stats, "bootstrap")
+        "bootstrap"
     } else {
-        let stats = crate::dump_autoload(&root, opts.dev)
-            .context("running dump-autoload after install")?;
-        (stats, "incremental")
+        crate::dump::write_outputs(
+            &cfg.root,
+            &cfg.vendor_dir,
+            &cfg.vendor_dir.join("composer"),
+            &classmap,
+        )
+        .context("writing autoload files (incremental)")?;
+        "incremental"
     };
 
     // One-line user-visible summary, mirroring the install/discover lines.
@@ -490,7 +596,28 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &composer_env,
             &mut composer_calls,
             opts.no_discover,
+            &unknown_plugin_refs,
         )?;
+
+        // pestphp/pest-plugin's post-autoload-dump subscriber writes
+        // vendor/pest-plugins.json from `extra.pest.plugins` across every
+        // installed package. composr replicates that natively so we don't
+        // have to delegate the whole event to composer just for it. Safe to
+        // run after the event proper — no script in service-app's
+        // post-autoload-dump consumes the file.
+        if crate::pest_plugins::is_present(&lock, opts.dev)
+            && crate::pest_plugins::is_allowed(&root_json)
+        {
+            let plugins = crate::pest_plugins::collect(&lock, opts.dev, &root_json);
+            let path = crate::pest_plugins::write(&vendor_dir, &plugins)
+                .context("writing vendor/pest-plugins.json")?;
+            tracing::info!(
+                "wrote {} ({} pest plugins)",
+                path.display(),
+                plugins.len()
+            );
+        }
+
         run_event(
             Lifecycle::PostInstallCmd,
             &runner,
@@ -500,6 +627,7 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
             &composer_env,
             &mut composer_calls,
             opts.no_discover,
+            &unknown_plugin_refs,
         )?;
     }
     if timing {
@@ -516,9 +644,10 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
     })
 }
 
-/// Run one lifecycle event. If the event has class-method entries (which
-/// require composer's EventDispatcher to dispatch correctly), shell out to
-/// `composer run-script <event>`. Otherwise use our native runner.
+/// Run one lifecycle event. Delegates to `composer run-script <event>` when
+/// composer is required (class-method handler in composer.json scripts, OR
+/// any unknown composer-plugin in the lock that may have a subscriber for
+/// this event). Otherwise uses our native runner.
 ///
 /// The post-autoload-dump event additionally gets a Laravel-aware fast path:
 /// when every entry is either a `package:discover` artisan invocation, the
@@ -536,8 +665,32 @@ fn run_event(
     env: &HashMap<String, String>,
     composer_calls: &mut usize,
     no_discover: bool,
+    unknown_plugins: &[&str],
 ) -> Result<()> {
     let key = event.key();
+
+    // If any composer-plugin in the lock isn't on a known list, its
+    // `getSubscribedEvents` may register handlers for this event that we
+    // can't dispatch natively. Force composer delegation to be safe — even
+    // when composer.json has no scripts for this event (subscribers fire
+    // anyway). When composer isn't reachable, fall through to native
+    // dispatch with the warning that already fired in run().
+    if !unknown_plugins.is_empty() {
+        if let Some(c) = composer {
+            tracing::info!(
+                "delegating {key} to composer (unknown plugin subscribers may fire: {})",
+                unknown_plugins.join(", ")
+            );
+            let outcome = c.run_script(cwd, env, key)?;
+            *composer_calls += 1;
+            tracing::info!(
+                "composer run-script {key} completed in {}ms",
+                outcome.elapsed_ms
+            );
+            return Ok(());
+        }
+    }
+
     let entries = match scripts_section.get(key) {
         Some(v) => v,
         None => return Ok(()),
@@ -860,101 +1013,12 @@ fn composer_json_content_hash(path: &Path) -> Result<String> {
     }
 
     let mut json = String::with_capacity(bytes.len());
-    php_json_encode(&Value::Object(ordered), &mut json);
+    crate::php_json::encode_into(
+        &Value::Object(ordered),
+        &mut json,
+        crate::php_json::EncodeOptions::default(),
+    );
     Ok(format!("{:x}", md5_compute(json.as_bytes())))
-}
-
-/// PHP-compatible `json_encode($x, JSON_THROW_ON_ERROR)` for the subset of
-/// JSON we care about (composer.json content). The cases we deliberately
-/// don't handle: floats with non-trivial representations, NaN/Infinity
-/// (PHP refuses these). composer.json doesn't contain any.
-fn php_json_encode(v: &Value, out: &mut String) {
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(true) => out.push_str("true"),
-        Value::Bool(false) => out.push_str("false"),
-        Value::Number(n) => {
-            // serde_json's Display matches PHP's `json_encode` for the
-            // representations that appear in composer.json (small
-            // integers, the rare float).
-            out.push_str(&n.to_string());
-        }
-        Value::String(s) => php_json_encode_string(s, out),
-        Value::Array(arr) => {
-            out.push('[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                php_json_encode(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            // PHP gotcha: `json_decode('{}', true)` produces an empty
-            // associative array `[]`, and `json_encode([])` emits `[]`,
-            // not `{}`. So the canonical PHP round-trip turns every
-            // empty object into an empty array. composer.json hits this
-            // on shapes like `extra: { "laravel": {} }` (the `laravel`
-            // sub-key is empty for projects that have no auto-discovery
-            // overrides). Match the PHP behavior.
-            if map.is_empty() {
-                out.push_str("[]");
-            } else {
-                out.push('{');
-                for (i, (k, v)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    php_json_encode_string(k, out);
-                    out.push(':');
-                    php_json_encode(v, out);
-                }
-                out.push('}');
-            }
-        }
-    }
-}
-
-/// Encode a string the way PHP's `json_encode` does with options=0:
-/// double-quoted, with `\/`, `\u00XX` for control chars, named escapes
-/// for `\b\t\n\f\r"`, and `\uXXXX` for any code point above 0x7F
-/// (surrogate pair for supplementary-plane).
-fn php_json_encode_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '/' => out.push_str("\\/"),
-            '\x08' => out.push_str("\\b"),
-            '\x09' => out.push_str("\\t"),
-            '\x0a' => out.push_str("\\n"),
-            '\x0c' => out.push_str("\\f"),
-            '\x0d' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c if (c as u32) < 0x80 => {
-                out.push(c);
-            }
-            c => {
-                use std::fmt::Write;
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    let _ = write!(out, "\\u{:04x}", cp);
-                } else {
-                    // Encode as UTF-16 surrogate pair (PHP json_encode does this).
-                    let v = cp - 0x10000;
-                    let high = 0xD800 + (v >> 10);
-                    let low = 0xDC00 + (v & 0x3FF);
-                    let _ = write!(out, "\\u{:04x}\\u{:04x}", high, low);
-                }
-            }
-        }
-    }
-    out.push('"');
 }
 
 /// Pure-Rust md5. We only use it for the content-hash check, which is
@@ -1112,42 +1176,6 @@ mod tests {
             parse_package_discover("@composer dump-autoload", root),
             None
         );
-    }
-
-    #[test]
-    fn php_json_encodes_string_like_php_json_encode() {
-        let mut out = String::new();
-        php_json_encode_string("hello", &mut out);
-        assert_eq!(out, "\"hello\"");
-
-        let mut out = String::new();
-        php_json_encode_string("https://example.com/x", &mut out);
-        // `/` escaped as `\/`, matches PHP default.
-        assert_eq!(out, "\"https:\\/\\/example.com\\/x\"");
-
-        let mut out = String::new();
-        php_json_encode_string("ñ", &mut out);
-        // U+00F1 → ñ (lowercase hex).
-        assert_eq!(out, "\"\\u00f1\"");
-
-        let mut out = String::new();
-        php_json_encode_string("\"\\\n\t", &mut out);
-        assert_eq!(out, "\"\\\"\\\\\\n\\t\"");
-
-        // Supplementary plane → surrogate pair. U+1F600 = 😀.
-        let mut out = String::new();
-        php_json_encode_string("😀", &mut out);
-        assert_eq!(out, "\"\\ud83d\\ude00\"");
-    }
-
-    #[test]
-    fn php_json_encode_compact_object_matches_php_default() {
-        let v = serde_json::json!({ "a": 1, "b": [true, false, null] });
-        let mut out = String::new();
-        php_json_encode(&v, &mut out);
-        // Compact, no whitespace, no trailing newline. Mirrors
-        // `json_encode($x, JSON_THROW_ON_ERROR)`.
-        assert_eq!(out, r#"{"a":1,"b":[true,false,null]}"#);
     }
 
     /// Helper for hash tests: write `body` to a tempfile and compute the

@@ -160,20 +160,57 @@ pub fn bootstrap_complete(vendor_dir: &Path) -> bool {
 /// Composer-plugin packages whose activation only registers event
 /// subscribers / runtime strategy lookups — installing their files is
 /// enough; activation is safely a no-op for our purposes. Anything NOT on
-/// this list is treated conservatively (warned about at install time, or
-/// triggers composer delegation if activation matters). Project-local
-/// extensions live in `composr.json` → `allow-inert-plugins`.
+/// this list (and not on [`NATIVELY_REPLICATED_PLUGINS`]) is treated
+/// conservatively (warned about at install time, or triggers composer
+/// delegation if activation matters). Project-local extensions live in
+/// `composr.json` → `allow-inert-plugins`.
 pub const INERT_ALLOWLIST: &[&str] = &[
-    "pestphp/pest-plugin",
     "pestphp/pest-plugin-laravel",
     "pestphp/pest-plugin-mock",
     "pestphp/pest-plugin-arch",
     "pestphp/pest-plugin-type-coverage",
-    // tbachert/spi: registers SPI providers at runtime, no install-time
-    // file writes
-    "tbachert/spi",
     "phpstan/extension-installer",
+    // php-http/discovery: subscribes to pre-autoload-dump (which composr
+    // doesn't dispatch) and post-update-cmd (which composr doesn't run).
+    // Its preAutoloadDump only writes a file when the root has
+    // `extra.discovery` pins; otherwise no-op. Safe to skip.
+    "php-http/discovery",
 ];
+
+/// Composer-plugin packages whose install-time hooks composr replicates
+/// natively (no composer subprocess needed). Treated as "known" alongside
+/// [`INERT_ALLOWLIST`] for warning/delegation purposes.
+///
+/// - `pestphp/pest-plugin` writes `vendor/pest-plugins.json` at
+///   post-autoload-dump (see [`crate::pest_plugins`]); without it pest's
+///   runtime Loader returns no plugins and every Pest plugin silently
+///   no-ops.
+/// - `tbachert/spi` writes `vendor/composer/GeneratedServiceProviderData.php`
+///   at pre-autoload-dump (see [`crate::spi`]); without it every
+///   `ServiceLoader::load(...)` returns an empty list.
+pub const NATIVELY_REPLICATED_PLUGINS: &[&str] = &["pestphp/pest-plugin", "tbachert/spi"];
+
+/// Composer-plugin package names in the lock that we don't have explicit
+/// knowledge about — i.e. not on [`INERT_ALLOWLIST`], not on
+/// [`NATIVELY_REPLICATED_PLUGINS`], and not pattern-matched by the project's
+/// `composr.json` `allow-inert-plugins`. Their install-time hooks may or may
+/// not be load-bearing; the safe move is to delegate the lifecycle event to
+/// `composer run-script` so composer can dispatch their subscribers.
+pub fn unknown_plugins<'a>(
+    lock: &'a crate::lock::Lock,
+    composr_cfg: &crate::composr_config::ComposrConfig,
+) -> Vec<&'a str> {
+    lock.packages
+        .iter()
+        .filter(|p| p.package_type == "composer-plugin")
+        .map(|p| p.name.as_str())
+        .filter(|n| {
+            !INERT_ALLOWLIST.contains(n)
+                && !NATIVELY_REPLICATED_PLUGINS.contains(n)
+                && !composr_cfg.allows_inert(n)
+        })
+        .collect()
+}
 
 /// Returns true if any package in the lock declares a `composer-plugin` type
 /// AND the plugin is one whose activation writes install-time state we can't
@@ -183,7 +220,10 @@ pub fn lock_needs_plugin_activation(lock: &crate::lock::Lock) -> bool {
     lock.packages
         .iter()
         .filter(|p| p.package_type == "composer-plugin")
-        .any(|p| !INERT_ALLOWLIST.contains(&p.name.as_str()))
+        .any(|p| {
+            !INERT_ALLOWLIST.contains(&p.name.as_str())
+                && !NATIVELY_REPLICATED_PLUGINS.contains(&p.name.as_str())
+        })
 }
 
 /// Returns true if any entry in `script_entries` is a class-method handler

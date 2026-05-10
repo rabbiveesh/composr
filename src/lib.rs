@@ -18,7 +18,10 @@ pub mod install;
 pub mod installed;
 pub mod lock;
 pub mod parse;
+pub mod pest_plugins;
+pub mod php_json;
 pub mod scripts;
+pub mod spi;
 pub mod walk;
 
 use std::path::{Path, PathBuf};
