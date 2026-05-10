@@ -133,8 +133,8 @@ pub struct ExtractResult {
 
 /// Top-level entry point: extract `archive` (a `.zip` on disk) into the
 /// final install path under `vendor_dir`. Uses a unique temp dir under
-/// `vendor_dir/composer/` so plugin or installer dirs in vendor don't leak
-/// into our staging.
+/// `vendor_dir/composer/` so plugin or installer dirs in vendor don't
+/// leak into staging, and so finalize is a same-volume `rename`.
 pub fn extract_zip_to_install_path(
     archive: &Path,
     install_path: &Path,
@@ -167,10 +167,8 @@ pub fn extract_zip_to_install_path(
     let extract = || -> Result<u64> {
         fs::create_dir_all(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        let bytes = extract_zip_into(archive, &tmp)?;
-        Ok(bytes)
+        extract_zip_into(archive, &tmp)
     };
-
     let bytes = match extract() {
         Ok(b) => b,
         Err(e) => {
@@ -179,8 +177,6 @@ pub fn extract_zip_to_install_path(
         }
     };
 
-    // Single-top-dir strip: if `tmp/` contains exactly one entry and it's a
-    // dir, treat that dir's contents as the package contents.
     let source = match single_top_dir(&tmp)? {
         Some(d) => d,
         None => tmp.clone(),
@@ -190,12 +186,7 @@ pub fn extract_zip_to_install_path(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent {}", parent.display()))?;
     }
-
-    // Move source -> install_path. Try a rename first; if cross-device or
-    // fails for another reason, fall back to recursive copy.
     if install_path.exists() {
-        // empty_dir above should have removed it for non-empty case, but
-        // emptying can leave the dir itself; remove it now so rename works.
         let _ = fs::remove_dir(install_path);
     }
     if let Err(e) = fs::rename(&source, install_path) {
@@ -213,7 +204,6 @@ pub fn extract_zip_to_install_path(
         })?;
     }
 
-    // Cleanup tmp (it might still hold the wrapper dir or stale files).
     let _ = remove_dir_best_effort(&tmp);
 
     Ok(ExtractResult {
@@ -222,26 +212,26 @@ pub fn extract_zip_to_install_path(
     })
 }
 
-fn unique_tmp_dir(under: &Path) -> Result<PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(under.join(format!(".dumpr-{pid}-{now:x}-{n}")))
-}
-
 fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<u64> {
     let f = fs::File::open(archive)
         .with_context(|| format!("opening {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(f)
         .with_context(|| format!("reading zip {}", archive.display()))?;
-    let mut total: u64 = 0;
+
+    // Two-pass: first walk dedups directories so we mkdir each unique
+    // parent once instead of once per file (a typical PHP archive has
+    // ~10x more file entries than unique dirs). Then a second walk
+    // replays by index for the actual content writes.
+    struct Entry {
+        idx: usize,
+        dest: PathBuf,
+        unix_mode: Option<u32>,
+    }
+    let mut entries: Vec<Entry> = Vec::with_capacity(zip.len());
+    let mut unique_dirs: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
     for i in 0..zip.len() {
-        let mut entry = zip
+        let entry = zip
             .by_index(i)
             .with_context(|| format!("reading zip entry {i} from {}", archive.display()))?;
         let entry_name = entry
@@ -257,32 +247,66 @@ fn extract_zip_into(archive: &Path, out_dir: &Path) -> Result<u64> {
         }
         let dest = out_dir.join(&entry_name);
         if entry.is_dir() {
-            fs::create_dir_all(&dest)
-                .with_context(|| format!("mkdir {}", dest.display()))?;
+            unique_dirs.insert(dest);
             continue;
         }
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir {}", parent.display()))?;
+            if !unique_dirs.contains(parent) {
+                unique_dirs.insert(parent.to_path_buf());
+            }
         }
-        let mut out = fs::File::create(&dest)
-            .with_context(|| format!("creating {}", dest.display()))?;
-        let n = io::copy(&mut entry, &mut out)
-            .with_context(|| format!("extracting {}", dest.display()))?;
-        total = total.saturating_add(n);
+        entries.push(Entry {
+            idx: i,
+            dest,
+            unix_mode: entry.unix_mode(),
+        });
+    }
 
-        // Restore unix permissions if present in the zip metadata. Composer
-        // archives store +x on bin entries; without this their `bin` proxies
-        // wouldn't be runnable.
+    for d in &unique_dirs {
+        fs::create_dir_all(d)
+            .with_context(|| format!("mkdir {}", d.display()))?;
+    }
+
+    let mut total: u64 = 0;
+    for ent in &entries {
+        let mut entry = zip
+            .by_index(ent.idx)
+            .with_context(|| format!("reading entry {} from {}", ent.idx, archive.display()))?;
+        let mut out = fs::File::create(&ent.dest)
+            .with_context(|| format!("creating {}", ent.dest.display()))?;
+        let n = io::copy(&mut entry, &mut out)
+            .with_context(|| format!("extracting {}", ent.dest.display()))?;
+        total = total.saturating_add(n);
+        // Restore unix permissions from the zip metadata. Skip the syscall
+        // for plain 0o644 — `File::create` + default umask 022 already
+        // produces that mode, so calling `set_permissions` would be a
+        // no-op. Keeps the +x bits intact for `bin/*` entries.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = entry.unix_mode() {
-                let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(mode));
+            if let Some(mode) = ent.unix_mode {
+                if mode & 0o777 != 0o644 {
+                    let _ = fs::set_permissions(
+                        &ent.dest,
+                        fs::Permissions::from_mode(mode),
+                    );
+                }
             }
         }
     }
     Ok(total)
+}
+
+fn unique_tmp_dir(under: &Path) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(under.join(format!(".dumpr-{pid}-{now:x}-{n}")))
 }
 
 fn has_traversal(p: &Path) -> bool {
