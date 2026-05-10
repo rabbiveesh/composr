@@ -205,16 +205,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 composer_bin: args.composer_bin,
                 no_discover: args.no_discover,
             })?;
-            eprintln!(
-                "install: {} installed, {} removed ({} cached, {} fetched) in {}ms ({} composer call{})",
-                report.installed,
-                report.removed,
-                report.from_cache,
-                report.fetched,
-                report.elapsed_ms,
-                report.composer_calls,
-                if report.composer_calls == 1 { "" } else { "s" }
-            );
+            composr::summary::print_install(&report, None);
             Ok(0)
         }
         Some(Cmd::GitHook(args)) => Ok(run_git_hook(&root, &args.label)),
@@ -268,18 +259,7 @@ fn run_git_hook(root: &std::path::Path, label: &str) -> i32 {
         composer_bin: None,
         no_discover: false,
     }) {
-        Ok(report) => {
-            eprintln!(
-                "install: {} installed, {} removed ({} cached, {} fetched) in {}ms ({} composer call{})",
-                report.installed,
-                report.removed,
-                report.from_cache,
-                report.fetched,
-                report.elapsed_ms,
-                report.composer_calls,
-                if report.composer_calls == 1 { "" } else { "s" }
-            );
-        }
+        Ok(report) => composr::summary::print_install(&report, Some(label)),
         Err(e) => {
             eprintln!("{dim}[{label}]{reset} install failed: {e:#} {dim}(continuing){reset}");
         }

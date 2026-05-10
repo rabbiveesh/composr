@@ -560,27 +560,10 @@ pub fn run(opts: InstallOptions) -> Result<InstallReport> {
         "incremental"
     };
 
-    // One-line user-visible summary, mirroring the install/discover lines.
-    // Headline metrics: total classes, per-package classmap-cache hit rate
-    // (the headline win when warm), per-file mtime-cache hit rate (the
-    // root + uncacheable packages), and wall time.
-    let pkg_total = autoload_stats.package_cache_hits + autoload_stats.package_cache_misses;
-    let pkg_summary = if pkg_total > 0 {
-        format!(
-            "{}/{} pkg cached",
-            autoload_stats.package_cache_hits, pkg_total
-        )
-    } else {
-        "no cacheable pkgs".to_string()
-    };
-    println!(
-        "  Autoload ({}): {} classes ({}, {} files reparsed, {}ms)",
-        autoload_mode,
-        autoload_stats.classes,
-        pkg_summary,
-        autoload_stats.misses,
-        autoload_stats.elapsed_ms
-    );
+    // One-line styled summary (`autoload (mode)  blazing  ·  Xms  ·  …`).
+    // Word picks (blazing/refreshed/rebuilt/bumpy) are computed from the
+    // hit-rate + error counts in summary.rs.
+    crate::summary::print_autoload(&autoload_stats, autoload_mode, None);
     if timing {
         eprintln!("STAGE bootstrap: {}ms", t_bootstrap.elapsed().as_millis());
     }

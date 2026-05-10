@@ -22,6 +22,7 @@ pub mod pest_plugins;
 pub mod php_json;
 pub mod scripts;
 pub mod spi;
+pub mod summary;
 pub mod walk;
 
 use std::path::{Path, PathBuf};
