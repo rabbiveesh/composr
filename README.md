@@ -72,6 +72,7 @@ critical path after the first run.
 composr install            # lock-driven install: download → extract → autoload bootstrap → scripts
 composr dump-autoload      # rewrite vendor/composer/autoload_classmap.php (and patch autoload_static.php)
 composr discover           # rewrite bootstrap/cache/packages.php (Laravel's package:discover)
+composr install-hooks      # write post-checkout/-merge/-rewrite git hooks (see "Git hooks")
 composr                    # alias for `dump-autoload` (back-compat with the original tool name)
 ```
 
@@ -230,7 +231,20 @@ preamble line, suitable for `post-checkout` / `post-merge` /
 and always exits 0, so a sync that fails for any reason can't block the
 git op. The only thing you need on `$PATH` is `composr` itself.
 
-Drop these into `.git/hooks/` (mark `chmod +x`):
+The fast path is to let composr write the hooks for you:
+
+```sh
+composr install-hooks
+```
+
+That drops `post-checkout`, `post-merge`, and `post-rewrite` into the
+repo's hooks dir (resolved via git, so `core.hooksPath`, worktrees, and
+submodules all work) and marks them executable. Re-running is safe — it
+overwrites only hooks composr wrote and skips any it doesn't recognize
+(pass `--force` to overwrite those too).
+
+If you'd rather wire them up by hand, drop these into `.git/hooks/`
+(mark `chmod +x`) — they're exactly what `install-hooks` writes:
 
 ```sh
 # .git/hooks/post-checkout
@@ -267,25 +281,15 @@ is safe to fire on every branch switch.
 
 ## Optional helper scripts (`scripts/`)
 
-A few extra shell helpers live in `scripts/` for cases the binary
-doesn't cover. Drop the directory on `$PATH` (or symlink individual
-files into `~/bin`) to use them.
+One extra shell helper lives in `scripts/` for a case the binary
+doesn't cover. Drop it on `$PATH` (or symlink it into `~/bin`) to use
+it. (It's in the git repo only — not shipped in the published crate.)
 
 - **`composer-dump-fast`** — drop-in for `composer dump-autoload -o`:
   runs the native classmap dumper, then asks composer to fire
   pre/post-autoload-dump scripts (so Laravel's `package:discover` and
   friends still run). Useful in CI flows that compose composr with a
   partial composer dispatch.
-- **`_autoload_dumpr_run <label> [args...]`** /
-  **`_autoload_dumpr_pretty <label>`** — wrap `composr dump-autoload
-  --emit-stats` with a colored "starting…" preamble + one-line
-  summary, for git hooks or wrappers that want richer output than the
-  binary's default. (Filenames are a relic of the original
-  `autoload-dumpr` binary; both scripts drive `composr` now.)
-- **`_composr_git_hook <label> [unused] [unused]`** — back-compat
-  forwarder to `composr git-hook <label>`. Kept so hook files written
-  before the subcommand existed keep working; new ones should call
-  the subcommand directly.
 
 ## Limitations & out-of-scope
 

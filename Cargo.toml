@@ -1,10 +1,17 @@
 [package]
 name = "composr"
-version = "0.3.2"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Fast Rust install + dump-autoload for Composer projects (vowels not included)"
 license = "MIT"
+repository = "https://github.com/rabbiveesh/composr"
+homepage = "https://github.com/rabbiveesh/composr"
+readme = "README.md"
+keywords = ["composer", "php", "autoload", "laravel", "install"]
+categories = ["command-line-utilities", "development-tools"]
+# assets/ is embedded via include_bytes! at build time — never exclude it.
+exclude = ["scripts/", "tests/"]
 
 [[bin]]
 name = "composr"

@@ -41,6 +41,12 @@ enum Cmd {
     /// op. Bails silently when there's no composer.json at cwd.
     #[command(name = "git-hook")]
     GitHook(GitHookArgs),
+    /// Install post-checkout / post-merge / post-rewrite hooks into this
+    /// repo's hooks dir so vendor + classmap stay in sync across branch
+    /// switches, pulls, and rebases. Each hook just calls `composr git-hook`
+    /// and exits 0 on its own, so a failed sync never blocks the git op.
+    #[command(name = "install-hooks")]
+    InstallHooks(InstallHooksArgs),
     /// Synthetic filesystem benchmark for picking a fast staging surface.
     /// Runs an extract-shaped workload (parallel mkdirs + small file
     /// writes + renames + rm -rf) against each given path and reports
@@ -114,6 +120,14 @@ struct GitHookArgs {
     /// signature-compatibility with git's hook conventions but ignored.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     _trailing: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
+struct InstallHooksArgs {
+    /// Overwrite existing hook files even if composr didn't write them.
+    /// Without this, a hook composr doesn't recognize is left untouched.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -236,6 +250,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Some(Cmd::GitHook(args)) => Ok(run_git_hook(&root, &args.label)),
+        Some(Cmd::InstallHooks(args)) => run_install_hooks(&root, args.force),
         Some(Cmd::BenchFs(args)) => {
             run_bench_fs(BenchOptions {
                 paths: args.paths,
@@ -302,6 +317,100 @@ fn run_git_hook(root: &std::path::Path, label: &str) -> i32 {
         }
     }
     0
+}
+
+/// Marker line embedded in every hook composr writes. Lets a re-run (or a
+/// future `install-hooks`) recognize its own files and overwrite them
+/// silently, while leaving hooks composr didn't author untouched.
+const HOOK_MARKER: &str = "# managed by composr install-hooks";
+
+const POST_CHECKOUT_HOOK: &str = "#!/usr/bin/env bash\n\
+# managed by composr install-hooks\n\
+[ \"$3\" = \"1\" ] || exit 0\n\
+command -v composr >/dev/null 2>&1 || exit 0\n\
+composr git-hook post-checkout\n";
+
+const POST_MERGE_HOOK: &str = "#!/usr/bin/env bash\n\
+# managed by composr install-hooks\n\
+command -v composr >/dev/null 2>&1 || exit 0\n\
+composr git-hook post-merge\n";
+
+const POST_REWRITE_HOOK: &str = "#!/usr/bin/env bash\n\
+# managed by composr install-hooks\n\
+cat >/dev/null     # drain stdin so we don't SIGPIPE the parent\n\
+command -v composr >/dev/null 2>&1 || exit 0\n\
+composr git-hook post-rewrite\n";
+
+/// Write the three git hooks into the repo's hooks dir. Idempotent: a hook
+/// composr previously wrote (carries `HOOK_MARKER`) is overwritten silently;
+/// a foreign hook is skipped with a warning unless `--force` is given.
+fn run_install_hooks(root: &std::path::Path, force: bool) -> Result<i32> {
+    let hooks_dir = resolve_hooks_dir(root)?;
+    std::fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("creating {}", hooks_dir.display()))?;
+
+    let hooks = [
+        ("post-checkout", POST_CHECKOUT_HOOK),
+        ("post-merge", POST_MERGE_HOOK),
+        ("post-rewrite", POST_REWRITE_HOOK),
+    ];
+
+    let mut wrote = 0;
+    let mut skipped = 0;
+    for (name, body) in hooks {
+        let path = hooks_dir.join(name);
+        if path.exists() && !force {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if !existing.contains(HOOK_MARKER) {
+                eprintln!(
+                    "skipped {name}: {} exists and wasn't written by composr (use --force to overwrite)",
+                    path.display()
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+        std::fs::write(&path, body)
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("setting +x on {}", path.display()))?;
+        }
+        println!("installed {}", path.display());
+        wrote += 1;
+    }
+
+    if wrote > 0 {
+        println!(
+            "{wrote} hook(s) installed — vendor + classmap will sync on checkout/merge/rebase."
+        );
+    }
+    // Exit non-zero only if every hook was skipped, so scripting can tell the
+    // difference between "nothing to do" and "did nothing because conflicts".
+    Ok(if wrote == 0 && skipped > 0 { 1 } else { 0 })
+}
+
+/// Resolve the hooks directory via git itself, so `core.hooksPath`, linked
+/// worktrees, and submodules (where `.git` is a file, not a dir) all work.
+fn resolve_hooks_dir(root: &std::path::Path) -> Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("running `git rev-parse --git-path hooks` (is git installed?)")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "not a git repository at {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p = PathBuf::from(&rel);
+    Ok(if p.is_absolute() { p } else { root.join(p) })
 }
 
 fn init_tracing(verbose: bool) {
