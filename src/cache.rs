@@ -7,7 +7,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const CACHE_VERSION: u32 = 3;
+/// Bump on shape change, and whenever the parser's output can change (a
+/// tree-sitter-php grammar bump), since entries cache `Declaration`s.
+const CACHE_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Cache {

@@ -26,9 +26,10 @@ use std::path::{Path, PathBuf};
 /// The cached data is *post-admission* — i.e. the FQCN→file pairs that
 /// survive `filter::admit` for this package's autoload config. So a
 /// change to admission semantics (PSR-4/PSR-0 strictness, classmap
-/// include rules) needs a version bump even though the on-disk shape
+/// include rules) or to what the parser extracts (a tree-sitter-php
+/// grammar bump) needs a version bump even though the on-disk shape
 /// hasn't changed.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// One package's contribution to the classmap, in the smallest form
 /// that lets us merge it into the global map without walking or

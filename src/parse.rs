@@ -30,7 +30,7 @@ pub struct PhpParser {
 impl PhpParser {
     pub fn new() -> Self {
         let mut parser = Parser::new();
-        let lang = tree_sitter_php::language_php();
+        let lang: tree_sitter::Language = tree_sitter_php::LANGUAGE_PHP.into();
         parser
             .set_language(&lang)
             .expect("tree-sitter-php language version mismatch");
@@ -384,5 +384,27 @@ mod tests {
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].fqcn, vec![0xa9]);
         assert_eq!(decls[0].kind, DeclKind::Class);
+    }
+
+    #[test]
+    fn finds_class_containing_nowdoc_argument() {
+        // From laravel/framework's DatabaseSqliteSchemaStateTest.php: the
+        // tree-sitter-php 0.22 grammar lost the whole file to ERROR on this
+        // nowdoc and the class went missing from the classmap.
+        let r = extract(concat!(
+            "<?php\n",
+            "namespace A;\n",
+            "class B {\n",
+            "function f() {\n",
+            "        $files->shouldHaveReceived('put')->with('schema.sql', <<<'SQL'\n",
+            "            CREATE VIRTUAL TABLE posts using fts5(body)\n",
+            "            /* posts(body) */;\n",
+            "            CREATE TABLE IF NOT EXISTS \"logs_data\"(\"id\" integer primary key);\n",
+            "\n",
+            "            SQL.PHP_EOL);\n",
+            "}\n",
+            "}\n",
+        ));
+        assert_eq!(fqcns(&r), vec!["A\\B".to_string()]);
     }
 }
