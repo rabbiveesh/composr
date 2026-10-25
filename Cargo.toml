@@ -16,36 +16,69 @@ exclude = ["scripts/", "tests/"]
 [[bin]]
 name = "composr"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [lib]
 name = "composr"
 path = "src/lib.rs"
 
+[features]
+default = ["cli"]
+# Everything except the composer.json / composer.lock / installed.json readers
+# (`config`, `lock`, `installed`). Library users who only need those can set
+# `default-features = false` and skip tree-sitter, tokio, reqwest, zip, clap...
+cli = [
+    "dep:clap",
+    "dep:ignore",
+    "dep:rayon",
+    "dep:tree-sitter",
+    "dep:tree-sitter-php",
+    "dep:bincode",
+    "dep:sha1",
+    "dep:sha2",
+    "dep:hex",
+    "dep:globset",
+    "dep:tracing-subscriber",
+    "dep:memchr",
+    "dep:num_cpus",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:futures",
+    "dep:zip",
+    "dep:tempfile",
+    "dep:indicatif",
+    "dep:url",
+]
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-ignore = "0.4"
-rayon = "1.10"
-tree-sitter = "0.22"
-tree-sitter-php = "0.22"
-bincode = { version = "2", features = ["serde"] }
-sha1 = "0.10"
-sha2 = "0.10"
-hex = "0.4"
-globset = "0.4"
+ignore = { version = "0.4", optional = true }
+rayon = { version = "1.10", optional = true }
+tree-sitter = { version = "0.22", optional = true }
+tree-sitter-php = { version = "0.22", optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+globset = { version = "0.4", optional = true }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-memchr = "2"
-num_cpus = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
-futures = "0.3"
-zip = { version = "2", default-features = false, features = ["deflate", "bzip2"] }
-tempfile = "3"
-indicatif = "0.17"
-url = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+memchr = { version = "2", optional = true }
+num_cpus = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "io-util"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"], optional = true }
+futures = { version = "0.3", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate", "bzip2"], optional = true }
+tempfile = { version = "3", optional = true }
+indicatif = { version = "0.17", optional = true }
+url = { version = "2", optional = true }
+
+[[test]]
+name = "spi_real_world"
+required-features = ["cli"]
 
 [dev-dependencies]
 pretty_assertions = "1"
