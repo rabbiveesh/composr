@@ -223,6 +223,40 @@ golden-byte comparisons for both natively-replicated plugins
 (`pest-plugins.json` and `GeneratedServiceProviderData.php`) against
 real composer's output on a fixture lock.
 
+`cargo test --no-default-features` runs the tests for the lean reader
+modules alone (see below).
+
+## Using composr as a library
+
+The installer, dumper and the `composr` binary sit behind the `cli`
+feature, which is on by default. If you only need to read a project's
+Composer metadata, turn default features off:
+
+```toml
+[dependencies]
+composr = { version = "1.1", default-features = false }
+```
+
+That leaves three modules, which depend only on `serde`, `serde_json`,
+`anyhow` and `tracing` (no tree-sitter, tokio, reqwest, zip or clap):
+
+- `composr::config`: `ResolvedConfig::load(root, include_dev)` merges the
+  root `composer.json` with every installed package's autoload section
+  (PSR-4, PSR-0, classmap, files), with paths made absolute.
+- `composr::lock`: `Lock::read` / `Lock::parse` for `composer.lock`.
+- `composr::installed`: `InstalledJson::read` for
+  `vendor/composer/installed.json`, plus the `installed.json` /
+  `installed.php` writers.
+
+```rust
+let cfg = composr::config::ResolvedConfig::load(project_root, true)?;
+for pkg in &cfg.packages {
+    for (prefix, dirs) in &pkg.psr_4 {
+        println!("{} {prefix} -> {dirs:?}", pkg.name);
+    }
+}
+```
+
 ## Git hooks
 
 `composr git-hook <label>` runs `install --no-scripts` with a styled
