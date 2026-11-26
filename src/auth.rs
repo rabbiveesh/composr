@@ -6,7 +6,8 @@
 //!
 //! 1. `COMPOSER_AUTH` env (a JSON blob — same shape as auth.json's "config")
 //! 2. `<project>/auth.json`
-//! 3. `<COMPOSER_HOME>/auth.json` — typically `~/.composer/auth.json`
+//! 3. `<COMPOSER_HOME>/auth.json`, with the home folder found as Composer finds it: `~/.composer` on
+//!    macOS, usually `~/.config/composer` on Linux (see `resolve_composer_home`)
 //!
 //! Sources earlier in the list win on conflict (matches Composer).
 
@@ -144,15 +145,42 @@ fn read_auth_file(path: &Path) -> Result<AuthFile> {
 }
 
 fn composer_home() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("COMPOSER_HOME") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    let use_xdg = std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("XDG_"))
+        || Path::new("/etc/xdg").is_dir();
+    resolve_composer_home(
+        std::env::var_os("COMPOSER_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        use_xdg,
+    )
+}
+
+/// Composer's own order (`Factory::getHomeDir`, non-Windows): `COMPOSER_HOME`; else, when XDG is in use
+/// (any `XDG_*` variable, or `/etc/xdg` exists, as on most Linux desktops), `$XDG_CONFIG_HOME/composer`
+/// (default `~/.config/composer`) if it exists; else `~/.composer` if it exists; else the first of those.
+fn resolve_composer_home(
+    composer_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    use_xdg: bool,
+) -> Option<PathBuf> {
+    if let Some(p) = composer_home.filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
     }
-    // macOS: Composer historically uses $HOME/.composer (it doesn't follow
-    // XDG by default). Match that.
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".composer"))
+    let home = PathBuf::from(home?);
+    let mut dirs = Vec::new();
+    if use_xdg {
+        let config = xdg_config_home
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        dirs.push(config.join("composer"));
+    }
+    dirs.push(home.join(".composer"));
+    dirs.iter()
+        .find(|d| d.is_dir())
+        .cloned()
+        .or_else(|| dirs.into_iter().next())
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -243,5 +271,67 @@ mod tests {
             cfg.header_for("https://repo.example/x.zip"),
             Some("Basic dXNlcjpwYXNz".into())
         );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("composr-home-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn resolve(home: &Path, composer_home: Option<&str>, xdg_config_home: Option<&Path>, use_xdg: bool) -> PathBuf {
+        resolve_composer_home(
+            composer_home.map(Into::into),
+            Some(home.as_os_str().to_owned()),
+            xdg_config_home.map(|p| p.as_os_str().to_owned()),
+            use_xdg,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn composer_home_env_wins() {
+        let h = scratch("env");
+        std::fs::create_dir_all(h.join(".composer")).unwrap();
+        assert_eq!(resolve(&h, Some("/custom"), None, true), PathBuf::from("/custom"));
+        assert_eq!(resolve(&h, Some(""), None, false), h.join(".composer"));
+    }
+
+    #[test]
+    fn without_xdg_uses_dot_composer() {
+        let h = scratch("noxdg");
+        std::fs::create_dir_all(h.join(".config/composer")).unwrap();
+        assert_eq!(resolve(&h, None, None, false), h.join(".composer"));
+    }
+
+    #[test]
+    fn with_xdg_prefers_an_existing_config_composer() {
+        let h = scratch("xdg");
+        std::fs::create_dir_all(h.join(".config/composer")).unwrap();
+        std::fs::create_dir_all(h.join(".composer")).unwrap();
+        assert_eq!(resolve(&h, None, None, true), h.join(".config/composer"));
+    }
+
+    #[test]
+    fn with_xdg_falls_back_to_an_existing_dot_composer() {
+        let h = scratch("xdgdot");
+        std::fs::create_dir_all(h.join(".composer")).unwrap();
+        assert_eq!(resolve(&h, None, None, true), h.join(".composer"));
+    }
+
+    #[test]
+    fn with_xdg_and_neither_existing_picks_config_composer() {
+        let h = scratch("xdgnone");
+        assert_eq!(resolve(&h, None, None, true), h.join(".config/composer"));
+    }
+
+    #[test]
+    fn xdg_config_home_is_honoured() {
+        let h = scratch("xdgcfg");
+        let cfg = h.join("cfg");
+        std::fs::create_dir_all(cfg.join("composer")).unwrap();
+        std::fs::create_dir_all(h.join(".config/composer")).unwrap();
+        assert_eq!(resolve(&h, None, Some(&cfg), true), cfg.join("composer"));
     }
 }
